@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from urllib.parse import urlparse
 
 from minio import Minio
+from neo4j import GraphDatabase
 
 
 class DatabaseResource:
@@ -65,7 +66,9 @@ class RedisResource:
 class MinIOResource:
     """MinIO resource for dependency injection."""
 
-    def __init__(self, endpoint: str, access_key: str, secret_key: str, bucket_name: str):
+    def __init__(
+        self, endpoint: str, access_key: str, secret_key: str, bucket_name: str
+    ):
         self.endpoint = endpoint
         self.access_key = access_key
         self.secret_key = secret_key
@@ -75,7 +78,9 @@ class MinIOResource:
     async def init(self):
         """Initialize MinIO client."""
         # Parse endpoint to determine secure flag
-        parsed = urlparse(self.endpoint if "://" in self.endpoint else f"http://{self.endpoint}")
+        parsed = urlparse(
+            self.endpoint if "://" in self.endpoint else f"http://{self.endpoint}"
+        )
         secure = parsed.scheme == "https"
         netloc = parsed.netloc or parsed.path  # handle cases like "minio:9000"
 
@@ -96,3 +101,28 @@ class MinIOResource:
         found = self.client.bucket_exists(self.bucket_name)
         if not found:
             self.client.make_bucket(self.bucket_name)
+
+
+class Neo4jResource:
+    """Neo4j driver resource."""
+
+    def __init__(self, uri: str, user: str, password: str):
+        self.uri = uri
+        self.user = user
+        self.password = password
+        self.driver = None
+
+    async def init(self):
+        # Driver is synchronous factory; keep API symmetric
+        self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
+        # Verify connectivity
+        try:
+            self.driver.verify_connectivity()
+        except Exception:
+            # Let caller handle; keep resource constructed
+            pass
+        return self
+
+    async def shutdown(self):
+        if self.driver:
+            self.driver.close()

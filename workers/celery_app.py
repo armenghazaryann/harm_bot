@@ -7,7 +7,7 @@ app = Celery(
     "rag",
     broker=SETTINGS.REDIS.CELERY_BROKER_URL,
     backend=SETTINGS.REDIS.CELERY_RESULT_BACKEND,
-    include=["workers.tasks"]
+    include=["workers.tasks"],
 )
 
 app.conf.update(
@@ -18,20 +18,22 @@ app.conf.update(
         Queue("chunk"),
         Queue("embed"),
         Queue("index"),
-        Queue("eval"),
     ),
     task_routes={
-        "workers.tasks.process_document": {"queue": "ingest"},
-        "workers.tasks.chunk_document": {"queue": "chunk"},
+        # Transcript pipeline (distributed MVP)
+        "workers.tasks.create_transcript_utterances_jsonl": {"queue": "chunk"},
+        "workers.tasks.ingest_transcript_pg": {"queue": "ingest"},
+        "workers.tasks.ingest_transcript_neo4j": {"queue": "index"},
+        "workers.tasks.materialize_transcript_chunks": {"queue": "chunk"},
+        "workers.tasks.process_transcript_pipeline": {"queue": "ingest"},
+        # Embedding
         "workers.tasks.embed_chunks": {"queue": "embed"},
-        "workers.tasks.index_build": {"queue": "index"},
-        "workers.tasks.eval_run": {"queue": "eval"},
     },
     # Reliability defaults
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     # Global time limits (can be overridden per task)
     task_soft_time_limit=60,  # seconds
-    task_time_limit=90,       # seconds
+    task_time_limit=90,  # seconds
     worker_hijack_root_logger=False,
 )

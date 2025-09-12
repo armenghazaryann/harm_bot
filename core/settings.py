@@ -1,4 +1,3 @@
-import os
 from functools import lru_cache
 from typing import Literal
 
@@ -87,6 +86,12 @@ class OpenAISettings(CustomSettings):
     USE_OPENAI: bool = Field(default=True)
 
 
+class Neo4jSettings(CustomSettings):
+    NEO4J_URI: str = Field(default="bolt://localhost:7687")
+    NEO4J_USER: str = Field(default="neo4j")
+    NEO4J_PASSWORD: SecretStr = Field(default="neo4j")
+
+
 class ProcessingSettings(CustomSettings):
     PAGE_DPI: int = Field(default=300)
     EMBED_BATCH_SIZE: int = Field(default=128)
@@ -101,6 +106,7 @@ class Settings(BaseModel):
     MINIO: MinIOSettings = Field(default_factory=MinIOSettings)
     OPENAI: OpenAISettings = Field(default_factory=OpenAISettings)
     PROCESSING: ProcessingSettings = Field(default_factory=ProcessingSettings)
+    NEO4J: Neo4jSettings = Field(default_factory=Neo4jSettings)
 
 
 @lru_cache

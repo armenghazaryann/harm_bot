@@ -26,6 +26,7 @@ dependencies = [
   "python-multipart>=0.0.20",
   "spacy>=3.8.7",
   "openai>=1.40.0",
+  "neo4j>=5.22.0",
 ]
 
 [project.optional-dependencies]

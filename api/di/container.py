@@ -2,7 +2,12 @@ import structlog
 from dependency_injector import containers, providers
 
 from core.settings import SETTINGS
-from infra.resources import DatabaseResource, RedisResource, MinIOResource
+from infra.resources import (
+    DatabaseResource,
+    RedisResource,
+    MinIOResource,
+    Neo4jResource,
+)
 
 
 logger = structlog.get_logger("rag")
@@ -57,6 +62,14 @@ class DependencyContainer(containers.DeclarativeContainer):
         bucket_name=SETTINGS.MINIO.MINIO_BUCKET,
     )
 
+    # Neo4j
+    neo4j = providers.Resource(
+        Neo4jResource,
+        uri=SETTINGS.NEO4J.NEO4J_URI,
+        user=SETTINGS.NEO4J.NEO4J_USER,
+        password=SETTINGS.NEO4J.NEO4J_PASSWORD.get_secret_value(),
+    )
+
     # Services
     document_service = providers.Factory(
         "api.features.documents.service.DocumentService",
@@ -74,6 +87,28 @@ class DependencyContainer(containers.DeclarativeContainer):
         celery_app=None,  # TODO: Add Celery app
     )
 
+    # Workers: Transcript pipeline callables
+    transcript_process = providers.Callable(
+        "workers.transcripts.process_transcript_document"
+    )
+    transcript_create_jsonl = providers.Callable(
+        "workers.transcripts.create_utterances_jsonl"
+    )
+    transcript_ingest_pg = providers.Callable(
+        "workers.transcripts.ingest_transcript_pg_from_minio"
+    )
+    transcript_ingest_neo4j = providers.Callable(
+        "workers.transcripts.ingest_transcript_neo4j_from_minio"
+    )
+    transcript_materialize_chunks = providers.Callable(
+        "workers.transcripts.materialize_transcript_chunks_from_pg"
+    )
+
+    # Workers: Embeddings
+    embed_document_chunks = providers.Callable(
+        "workers.embeddings.embed_document_chunks"
+    )
+
     # Controllers
     document_controller = providers.Factory(
         "api.features.documents.controller.DocumentController",
@@ -84,6 +119,4 @@ class DependencyContainer(containers.DeclarativeContainer):
         "api.features.query.controller.QueryController"
     )
 
-    job_controller = providers.Factory(
-        "api.features.jobs.controller.JobController"
-    )
+    job_controller = providers.Factory("api.features.jobs.controller.JobController")

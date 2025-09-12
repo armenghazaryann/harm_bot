@@ -17,7 +17,7 @@ COPY pyproject.toml ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
      uv venv /opt/venv && \
-     uv pip install -e .
+     uv pip install -e .[pdf]
 ADD . /app
 
 FROM python:3.13-slim
