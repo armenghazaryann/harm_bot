@@ -1,7 +1,9 @@
 """Router for the Query feature."""
 from dependency_injector.wiring import Provide, inject
 from fastapi import APIRouter, Depends, Query as QueryParam
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.di.container import ApplicationContainer
 from api.features.query.controller import QueryController
 from api.features.query.dtos import (
     QueryRequest,
@@ -11,10 +13,10 @@ from api.features.query.dtos import (
     SuggestionRequest,
     SuggestionResponse,
     SemanticSearchRequest,
-    KeywordSearchRequest
+    KeywordSearchRequest,
 )
 from api.shared.dtos import HealthCheckResponse
-from api.di.container import DependencyContainer
+from api.shared.db import get_db_session
 from api.shared.response import ResponseModel
 
 router = APIRouter()
@@ -26,9 +28,9 @@ async def health_check():
     return ResponseModel.success(
         data=HealthCheckResponse(
             status="healthy",
-            dependencies={"embeddings": "ok", "llm": "ok", "database": "ok"}
+            dependencies={"embeddings": "ok", "llm": "ok", "database": "ok"},
         ),
-        message="Query service is healthy"
+        message="Query service is healthy",
     )
 
 
@@ -36,49 +38,66 @@ async def health_check():
 @inject
 async def search_documents(
     request: QueryRequest,
-    controller: QueryController = Depends(Provide[DependencyContainer.query_controller])
+    controller: QueryController = Depends(
+        Provide[ApplicationContainer.controllers.query_controller]
+    ),
+    db_session: AsyncSession = Depends(get_db_session),
 ):
     """Search documents using hybrid search (semantic + keyword)."""
-    return await controller.search_documents(request)
+    return await controller.search_documents(request, db_session)
 
 
 @router.post("/search/semantic", response_model=ResponseModel[SearchResponse])
 @inject
 async def semantic_search(
     request: SemanticSearchRequest,
-    controller: QueryController = Depends(Provide[DependencyContainer.query_controller])
+    controller: QueryController = Depends(
+        Provide[ApplicationContainer.controllers.query_controller]
+    ),
+    db_session: AsyncSession = Depends(get_db_session),
 ):
     """Perform semantic search using vector similarity."""
-    return await controller.semantic_search(request)
+    return await controller.semantic_search(request, db_session)
 
 
 @router.post("/search/keyword", response_model=ResponseModel[SearchResponse])
 @inject
 async def keyword_search(
     request: KeywordSearchRequest,
-    controller: QueryController = Depends(Provide[DependencyContainer.query_controller])
+    controller: QueryController = Depends(
+        Provide[ApplicationContainer.controllers.query_controller]
+    ),
+    db_session: AsyncSession = Depends(get_db_session),
 ):
     """Perform keyword search using full-text search."""
-    return await controller.keyword_search(request)
+    return await controller.keyword_search(request, db_session)
 
 
 @router.post("/answer", response_model=ResponseModel[AnswerResponse])
 @inject
 async def answer_question(
     request: AnswerRequest,
-    controller: QueryController = Depends(Provide[DependencyContainer.query_controller])
+    controller: QueryController = Depends(
+        Provide[ApplicationContainer.controllers.query_controller]
+    ),
+    db_session: AsyncSession = Depends(get_db_session),
 ):
     """Answer a question using RAG (Retrieval-Augmented Generation)."""
-    return await controller.answer_question(request)
+    return await controller.answer_question(request, db_session)
 
 
 @router.get("/suggestions", response_model=ResponseModel[SuggestionResponse])
 @inject
 async def get_query_suggestions(
     prefix: str = QueryParam("", description="Query prefix for suggestions"),
-    limit: int = QueryParam(10, ge=1, le=50, description="Maximum number of suggestions"),
-    controller: QueryController = Depends(Provide[DependencyContainer.query_controller])
+    limit: int = QueryParam(
+        10, ge=1, le=50, description="Maximum number of suggestions"
+    ),
+    controller: QueryController = Depends(
+        Provide[ApplicationContainer.controllers.query_controller]
+    ),
+    db_session: AsyncSession = Depends(get_db_session),
 ):
     """Get query suggestions based on prefix."""
     request = SuggestionRequest(prefix=prefix, limit=limit)
-    return await controller.get_query_suggestions(request)
+    return await controller.get_query_suggestions(request, db_session)

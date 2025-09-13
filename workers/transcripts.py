@@ -19,9 +19,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import structlog
+import alg
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.graphs import Neo4jGraph
+
+try:  # optional tokenizer for accurate token counting
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tiktoken = None  # type: ignore
 
 from core.settings import SETTINGS
-from infra.resources import DatabaseResource, MinIOResource, Neo4jResource
+from infra.resources import MinIOResource
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +40,32 @@ from api.features.query.entities.chunk import (
     ChunkType as ChunkTypeEnum,
 )
 
+from infra.db_utils import DatabaseManager
+
 logger = structlog.get_logger("workers.transcripts")
+
+
+# --------- DB Helpers (DRY) ---------
+
+
+async def _load_document(
+    session: AsyncSession, doc_id: str
+) -> Optional[DocumentEntity]:
+    stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+async def _update_processing_metadata(
+    session: AsyncSession, doc_id: str, updates: Dict[str, Any]
+) -> None:
+    ent = await _load_document(session, doc_id)
+    if ent is None:
+        return
+    meta = ent.processing_metadata or {}
+    meta.update(updates)
+    ent.processing_metadata = meta
+    await session.commit()
 
 
 @dataclass
@@ -137,7 +170,7 @@ SPEAKER_LABEL_RE = re.compile(
 SECTION_HEADERS = {
     "participants": re.compile(r"^participants$", re.IGNORECASE),
     "prepared_remarks": re.compile(
-        r"^(prepared\s+remarks|opening\s+remarks)$", re.IGNORECASE
+        r"^(prepared\s+remarks|opening\s+remarks|presentation)$", re.IGNORECASE
     ),
     "qa": re.compile(r"^(q\s*&\s*a|question\s+and\s+answer|q\+a)$", re.IGNORECASE),
 }
@@ -174,6 +207,10 @@ def segment_utterances(
     current_meta: Dict[str, Any] = {}
     current_text_parts: List[str] = []
     current_page_spans: List[Dict[str, Any]] = []
+    # Diagnostics
+    lines_total = 0
+    speaker_line_matches = 0
+    header_hits = {k: 0 for k in ["participants", "prepared_remarks", "qa"]}
 
     def flush_turn():
         nonlocal \
@@ -207,30 +244,40 @@ def segment_utterances(
         current_text_parts = []
         current_page_spans = []
 
+    # Relaxed speaker label: allow missing colon; optional firm after dash
+    RELAXED_SPEAKER_RE = re.compile(
+        r"^(?P<label>(?:[A-Z][A-Za-z'\-\.]+(?:\s+[A-Z][A-Za-z'\-\.]*)*|[A-Z][A-Z ]+)(?:\s*[—-]\s*[^:]+)?)\s*:?\s*(?P<rest>.*)$"
+    )
+
     for page in pages:
         # Cheap header/footer removal: drop extremely short lines that repeat page number patterns
         lines = [ln.strip() for ln in page.text.splitlines()]
-        for raw in lines:
+        for i, raw in enumerate(lines):
+            lines_total += 1
             if not raw:
                 continue
             # Section headers
             if SECTION_HEADERS["participants"].match(raw):
                 flush_turn()
                 current_section = "participants"
+                header_hits["participants"] += 1
                 continue
             if SECTION_HEADERS["prepared_remarks"].match(raw):
                 flush_turn()
                 current_section = "prepared_remarks"
+                header_hits["prepared_remarks"] += 1
                 continue
             if SECTION_HEADERS["qa"].match(raw):
                 flush_turn()
                 current_section = "qa"
+                header_hits["qa"] += 1
                 continue
 
             m = SPEAKER_LABEL_RE.match(raw)
             if m:
                 # Start new turn
                 flush_turn()
+                speaker_line_matches += 1
                 label = m.group("label").strip()
                 rest = m.group("rest").strip()
                 role, meta = _infer_role(label)
@@ -241,23 +288,133 @@ def segment_utterances(
                     current_text_parts.append(rest)
                 current_page_spans.append({"page_no": page.page_no})
             else:
-                # Continuation of current speaker or unmatched text (skip if no speaker yet)
-                if current_speaker:
-                    current_text_parts.append(raw)
-                    # Only add page once per contiguous block; here we append only if empty
-                    if (
-                        not current_page_spans
-                        or current_page_spans[-1].get("page_no") != page.page_no
-                    ):
-                        current_page_spans.append({"page_no": page.page_no})
+                # Try relaxed speaker detection (no colon). If matches and we don't currently
+                # have a speaker, start a new turn seeded with rest or next line.
+                m2 = RELAXED_SPEAKER_RE.match(raw)
+                if m2 and not current_speaker:
+                    label = m2.group("label").strip()
+                    rest = (m2.group("rest") or "").strip()
+                    role, meta = _infer_role(label)
+                    current_speaker = re.sub(r"\s{2,}", " ", label)
+                    current_role = role
+                    current_meta = meta
+                    seed = rest
+                    if not seed and i + 1 < len(lines):
+                        nxt = lines[i + 1].strip()
+                        # Seed with the next non-empty line to get speech going
+                        if nxt:
+                            seed = nxt
+                    if seed:
+                        current_text_parts.append(seed)
+                    current_page_spans.append({"page_no": page.page_no})
+                    speaker_line_matches += 1
                 else:
-                    # Unmatched lines before first speaker: ignore or collect to meta
-                    pass
+                    # Continuation of current speaker or unmatched text (skip if no speaker yet)
+                    if current_speaker:
+                        current_text_parts.append(raw)
+                        # Only add page once per contiguous block; here we append only if empty
+                        if (
+                            not current_page_spans
+                            or current_page_spans[-1].get("page_no") != page.page_no
+                        ):
+                            current_page_spans.append({"page_no": page.page_no})
+                    else:
+                        # Unmatched lines before first speaker: ignore or collect to meta
+                        pass
         # end for lines
     # end for pages
 
     # Final flush
     flush_turn()
+
+    # Fallback: if we failed to segment any turns, use alg.py approach on combined text
+    if not turns and pages:
+        combined = "\n".join(p.text for p in pages if p.text)
+        labels = alg.find_candidate_labels(combined)
+        dialogues = alg.segment_by_labels(combined, labels)
+        if not dialogues:
+            # second fallback from alg: simple line-based
+            lines = [ln.strip() for ln in combined.splitlines() if ln.strip()]
+            sp = re.compile(r"^([A-Z][A-Za-z0-9\s\.,&\-]{0,80}?):\s*(.*)$")
+            current_speaker = None
+            current_speech: List[str] = []
+            for line in lines:
+                m = sp.match(line)
+                if m:
+                    if current_speaker:
+                        speech = _normalize_text(" ".join(current_speech))
+                        if speech:
+                            role, meta = _infer_role(current_speaker)
+                            uid_src = (
+                                f"{doc_id}|{current_speaker}|{speech}|{turn_index}"
+                            )
+                            uid = hashlib.sha256(uid_src.encode("utf-8")).hexdigest()
+                            turns.append(
+                                Utterance(
+                                    utterance_id=uid,
+                                    doc_id=doc_id,
+                                    turn_index=turn_index,
+                                    speaker=current_speaker,
+                                    role=role,
+                                    speech=speech,
+                                    section=current_section,
+                                    page_spans=[],
+                                    extraction_method="text",
+                                    meta=meta,
+                                )
+                            )
+                            turn_index += 1
+                    current_speaker = m.group(1).strip()
+                    first = (m.group(2) or "").strip()
+                    current_speech = [first] if first else []
+                else:
+                    if current_speaker:
+                        current_speech.append(line)
+            if current_speaker:
+                speech = _normalize_text(" ".join(current_speech))
+                if speech:
+                    role, meta = _infer_role(current_speaker)
+                    uid_src = f"{doc_id}|{current_speaker}|{speech}|{turn_index}"
+                    uid = hashlib.sha256(uid_src.encode("utf-8")).hexdigest()
+                    turns.append(
+                        Utterance(
+                            utterance_id=uid,
+                            doc_id=doc_id,
+                            turn_index=turn_index,
+                            speaker=current_speaker,
+                            role=role,
+                            speech=speech,
+                            section=current_section,
+                            page_spans=[],
+                            extraction_method="text",
+                            meta=meta,
+                        )
+                    )
+                    turn_index += 1
+        else:
+            for d in dialogues:
+                speaker = d.get("speaker", "").strip()
+                speech = _normalize_text(d.get("speech", ""))
+                if not speaker or not speech:
+                    continue
+                role, meta = _infer_role(speaker)
+                uid_src = f"{doc_id}|{speaker}|{speech}|{turn_index}"
+                uid = hashlib.sha256(uid_src.encode("utf-8")).hexdigest()
+                turns.append(
+                    Utterance(
+                        utterance_id=uid,
+                        doc_id=doc_id,
+                        turn_index=turn_index,
+                        speaker=speaker,
+                        role=role,
+                        speech=speech,
+                        section=current_section,
+                        page_spans=[],
+                        extraction_method="text",
+                        meta=meta,
+                    )
+                )
+                turn_index += 1
 
     report = {
         "pages_total": len(pages),
@@ -268,6 +425,11 @@ def segment_utterances(
             for s in ["participants", "prepared_remarks", "qa", "other"]
         },
         "extraction_method": "text",
+        "diagnostics": {
+            "lines_total": lines_total,
+            "speaker_label_matches": speaker_line_matches,
+            "section_header_hits": header_hits,
+        },
     }
     return turns, report
 
@@ -286,20 +448,10 @@ async def _get_minio() -> MinIOResource:
     return minio
 
 
-async def _get_db() -> DatabaseResource:
-    db = DatabaseResource(database_url=str(SETTINGS.DATABASE.DATABASE_URL))
-    await db.init()
-    return db
+# Removed: use shared get_db from workers.db_utils
 
 
-async def _get_neo4j() -> Neo4jResource:
-    neo = Neo4jResource(
-        uri=SETTINGS.NEO4J.NEO4J_URI,
-        user=SETTINGS.NEO4J.NEO4J_USER,
-        password=SETTINGS.NEO4J.NEO4J_PASSWORD.get_secret_value(),
-    )
-    await neo.init()
-    return neo
+# Removed: use Neo4jGraph via LangChain instead of custom Neo4jResource
 
 
 async def read_pdf_from_minio(doc: DocumentEntity, minio: MinIOResource) -> bytes:
@@ -330,6 +482,24 @@ async def write_jsonl_to_minio(
         io.BytesIO(payload),
         length=len(payload),
         content_type="application/jsonl",
+    )
+    return key
+
+
+async def write_debug_text_to_minio(
+    doc_id: str, name: str, text: str, minio: MinIOResource
+) -> str:
+    """Write a plain text debug artifact to MinIO under transcripts/{doc_id}/{name}.txt"""
+    key = f"transcripts/{doc_id}/{name}.txt"
+    payload = text.encode("utf-8")
+    client = minio.client
+    bucket = minio.bucket_name
+    client.put_object(
+        bucket,
+        key,
+        io.BytesIO(payload),
+        length=len(payload),
+        content_type="text/plain; charset=utf-8",
     )
     return key
 
@@ -385,72 +555,70 @@ async def upsert_utterances_pg(
     return added
 
 
-# --------- Neo4j Ingestion ---------
+# --------- Neo4j Ingestion (via LangChain) ---------
 
 
-def _ensure_neo4j_constraints(session) -> None:
-    session.run(
+def ingest_graph_neo4j_langchain(doc_id: str, utterances: List[Utterance]) -> int:
+    """Ingest transcript graph into Neo4j using LangChain's Neo4jGraph wrapper.
+
+    This reduces custom driver code and keeps Cypher logic concise.
+    """
+    graph = Neo4jGraph(
+        url=SETTINGS.NEO4J.NEO4J_URI,
+        username=SETTINGS.NEO4J.NEO4J_USER,
+        password=SETTINGS.NEO4J.NEO4J_PASSWORD.get_secret_value(),
+    )
+    # Constraints and indexes
+    graph.query(
         "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Call) REQUIRE c.doc_id IS UNIQUE"
     )
-    session.run(
+    graph.query(
         "CREATE CONSTRAINT IF NOT EXISTS FOR (u:Utterance) REQUIRE u.utterance_id IS UNIQUE"
     )
-    session.run("CREATE INDEX IF NOT EXISTS FOR (s:Speaker) ON (s.name)")
+    graph.query("CREATE INDEX IF NOT EXISTS FOR (s:Speaker) ON (s.name)")
 
+    # Upsert Call
+    graph.query(
+        "MERGE (c:Call {doc_id:$doc_id}) ON CREATE SET c.source=$source",
+        params={
+            "doc_id": doc_id,
+            "source": f"minio://{SETTINGS.MINIO.MINIO_BUCKET}/raw/{doc_id}",
+        },
+    )
+    # Speakers roster
+    speakers = {u.speaker: u for u in utterances}
+    for spk, u in speakers.items():
+        graph.query("MERGE (s:Speaker {name:$name})", params={"name": spk})
+        firm = u.meta.get("firm")
+        if firm:
+            graph.query(
+                "MATCH (s:Speaker {name:$name}) SET s.firm = coalesce(s.firm, $firm)",
+                params={"name": spk, "firm": firm},
+            )
 
-def ingest_graph_neo4j(
-    doc_id: str, utterances: List[Utterance], neo: Neo4jResource
-) -> int:
-    driver = neo.driver
-    assert driver is not None
+    # Utterances + relationships
+    prev_uid: Optional[str] = None
     count = 0
-    with driver.session() as s:
-        _ensure_neo4j_constraints(s)
-        # Upsert Call
-        s.run(
-            "MERGE (c:Call {doc_id:$doc_id}) ON CREATE SET c.source=$source",
-            doc_id=doc_id,
-            source=f"minio://{SETTINGS.MINIO.MINIO_BUCKET}/raw/{doc_id}",
+    for u in utterances:
+        graph.query(
+            "MERGE (u:Utterance {utterance_id:$uid}) ON CREATE SET u.turn_index=$turn, u.section=$section",
+            params={"uid": u.utterance_id, "turn": u.turn_index, "section": u.section},
         )
-        # Upsert Speakers roster
-        speakers = {u.speaker: u for u in utterances}
-        for spk, u in speakers.items():
-            s.run(
-                "MERGE (s:Speaker {name:$name, firm:$firm})",
-                name=spk,
-                firm=u.meta.get("firm"),
+        graph.query(
+            "MATCH (c:Call {doc_id:$doc_id}), (u:Utterance {utterance_id:$uid}) MERGE (c)-[:CONTAINS]->(u)",
+            params={"doc_id": doc_id, "uid": u.utterance_id},
+        )
+        graph.query(
+            "MATCH (s:Speaker {name:$name}), (u:Utterance {utterance_id:$uid}) MERGE (s)-[:SPOKE]->(u)",
+            params={"name": u.speaker, "uid": u.utterance_id},
+        )
+        if prev_uid is not None:
+            graph.query(
+                "MATCH (u1:Utterance {utterance_id:$u1}), (u2:Utterance {utterance_id:$u2}) MERGE (u1)-[:NEXT]->(u2)",
+                params={"u1": prev_uid, "u2": u.utterance_id},
             )
-        # Utterances + relationships
-        prev_uid: Optional[str] = None
-        for u in utterances:
-            s.run(
-                "MERGE (u:Utterance {utterance_id:$uid}) "
-                "ON CREATE SET u.turn_index=$turn, u.section=$section",
-                uid=u.utterance_id,
-                turn=u.turn_index,
-                section=u.section,
-            )
-            s.run(
-                "MATCH (c:Call {doc_id:$doc_id}), (u:Utterance {utterance_id:$uid}) "
-                "MERGE (c)-[:CONTAINS]->(u)",
-                doc_id=doc_id,
-                uid=u.utterance_id,
-            )
-            s.run(
-                "MATCH (s:Speaker {name:$name}), (u:Utterance {utterance_id:$uid}) "
-                "MERGE (s)-[:SPOKE]->(u)",
-                name=u.speaker,
-                uid=u.utterance_id,
-            )
-            if prev_uid is not None:
-                s.run(
-                    "MATCH (u1:Utterance {utterance_id:$u1}), (u2:Utterance {utterance_id:$u2}) "
-                    "MERGE (u1)-[:NEXT]->(u2)",
-                    u1=prev_uid,
-                    u2=u.utterance_id,
-                )
-            prev_uid = u.utterance_id
-            count += 1
+        prev_uid = u.utterance_id
+        count += 1
     return count
 
 
@@ -458,72 +626,14 @@ def ingest_graph_neo4j(
 
 
 async def process_transcript_document(doc_id: str) -> Dict[str, Any]:
-    """End-to-end: MinIO PDF -> utterances.jsonl -> Postgres + Neo4j."""
-    # Resources
-    minio, db = await asyncio.gather(_get_minio(), _get_db())
+    """Deprecated: Orchestrate by calling existing steps; prefer Celery chain tasks.
 
-    # Fetch document
-    async with db.get_session() as session:
-        stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
-        res = await session.execute(stmt)
-        doc = res.scalar_one_or_none()
-        if not doc:
-            raise RuntimeError(f"Document {doc_id} not found")
-        # quick guard: ensure doc_type is transcript
-        doc_type_val = str(getattr(doc, "doc_type", "")).lower()
-        if "transcript" not in doc_type_val:
-            raise RuntimeError(
-                f"Document {doc_id} is not a transcript (doc_type={doc_type_val})"
-            )
-
-    # Download
-    pdf_bytes = await read_pdf_from_minio(doc, minio)
-
-    # Extract
-    pages = extract_pages(pdf_bytes)
-    for p in pages:
-        p.text = _normalize_text(p.text)
-
-    # Segment
-    turns, report = segment_utterances(pages, doc_id)
-
-    # Persist artifacts
-    key_jsonl, key_report = await asyncio.gather(
-        write_jsonl_to_minio(doc_id, [u.__dict__ for u in turns], minio),
-        write_report_to_minio(doc_id, report, minio),
-    )
-
-    # Postgres upsert and document metadata update
-    async with db.get_session() as session:
-        inserted = await upsert_utterances_pg(doc_id, turns, session)
-        # Update Document row: attach artifact keys to processing_metadata
-        stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
-        res = await session.execute(stmt)
-        ent = res.scalar_one_or_none()
-        if ent:
-            meta = ent.processing_metadata or {}
-            meta.update(
-                {
-                    "utterances_key": key_jsonl,
-                    "report_key": key_report,
-                    "utterances_count": len(turns),
-                }
-            )
-            ent.processing_metadata = meta
-            await session.commit()
-
-    # Neo4j ingest
-    neo = await _get_neo4j()
-    ingested = ingest_graph_neo4j(doc_id, turns, neo)
-
-    return {
-        "doc_id": doc_id,
-        "utterances_written": len(turns),
-        "pg_inserted": inserted,
-        "neo4j_ingested": ingested,
-        "utterances_key": key_jsonl,
-        "report_key": key_report,
-    }
+    Kept for compatibility in DI; internally delegates to smaller functions.
+    """
+    r1 = await create_utterances_jsonl(doc_id)
+    r2 = await ingest_transcript_pg_from_minio(doc_id)
+    r3 = await ingest_transcript_neo4j_from_minio(doc_id)
+    return {**r1, **r2, **r3}
 
 
 async def create_utterances_jsonl(doc_id: str) -> Dict[str, Any]:
@@ -531,13 +641,11 @@ async def create_utterances_jsonl(doc_id: str) -> Dict[str, Any]:
 
     Sets Document.status to CHUNKED and records artifact keys in processing_metadata.
     """
-    minio, db = await asyncio.gather(_get_minio(), _get_db())
+    minio, db = await asyncio.gather(_get_minio(), DatabaseManager.get_resource())
 
     # Load document
     async with db.get_session() as session:
-        stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
-        res = await session.execute(stmt)
-        doc = res.scalar_one_or_none()
+        doc = await _load_document(session, doc_id)
         if not doc:
             raise RuntimeError(f"Document {doc_id} not found")
         if "transcript" not in str(getattr(doc, "doc_type", "")).lower():
@@ -548,6 +656,16 @@ async def create_utterances_jsonl(doc_id: str) -> Dict[str, Any]:
     for p in pages:
         p.text = _normalize_text(p.text)
     turns, report = segment_utterances(pages, doc_id)
+    # If no turns, store first page text for debugging
+    if not turns and pages:
+        try:
+            debug_key = await write_debug_text_to_minio(
+                doc_id, "debug_first_page", pages[0].text, minio
+            )
+            report.setdefault("diagnostics", {})["debug_first_page_key"] = debug_key
+            report["diagnostics"]["debug_first_page_chars"] = len(pages[0].text)
+        except Exception as e:
+            logger.warning("debug_first_page_write_failed", error=str(e))
 
     key_jsonl, key_report = await asyncio.gather(
         write_jsonl_to_minio(doc_id, [u.__dict__ for u in turns], minio),
@@ -556,20 +674,15 @@ async def create_utterances_jsonl(doc_id: str) -> Dict[str, Any]:
 
     # Metadata update only
     async with db.get_session() as session:
-        stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
-        res = await session.execute(stmt)
-        ent = res.scalar_one_or_none()
-        if ent:
-            meta = ent.processing_metadata or {}
-            meta.update(
-                {
-                    "utterances_key": key_jsonl,
-                    "report_key": key_report,
-                    "utterances_count": len(turns),
-                }
-            )
-            ent.processing_metadata = meta
-            await session.commit()
+        await _update_processing_metadata(
+            session,
+            doc_id,
+            {
+                "utterances_key": key_jsonl,
+                "report_key": key_report,
+                "utterances_count": len(turns),
+            },
+        )
 
     return {
         "doc_id": doc_id,
@@ -641,9 +754,10 @@ async def load_utterances_from_minio(
 
 async def ingest_transcript_pg_from_minio(doc_id: str) -> Dict[str, Any]:
     """Load utterances.jsonl from MinIO and upsert into Postgres."""
-    minio, db = await asyncio.gather(_get_minio(), _get_db())
-    turns = await load_utterances_from_minio(doc_id, minio)
+    minio = await _get_minio()
+    db = await DatabaseManager.get_resource()
     async with db.get_session() as session:
+        turns = await load_utterances_from_minio(doc_id, minio)
         inserted = await upsert_utterances_pg(doc_id, turns, session)
     return {"doc_id": doc_id, "pg_inserted": inserted}
 
@@ -652,16 +766,56 @@ async def ingest_transcript_neo4j_from_minio(doc_id: str) -> Dict[str, Any]:
     """Load utterances.jsonl from MinIO and ingest graph into Neo4j."""
     minio = await _get_minio()
     turns = await load_utterances_from_minio(doc_id, minio)
-    neo = await _get_neo4j()
-    ingested = ingest_graph_neo4j(doc_id, turns, neo)
+    # Use LangChain Neo4jGraph for simpler ingestion
+    ingested = ingest_graph_neo4j_langchain(doc_id, turns)
     return {"doc_id": doc_id, "neo4j_ingested": ingested}
 
 
 async def materialize_transcript_chunks_from_pg(doc_id: str) -> Dict[str, Any]:
-    """Create Chunk rows (one per utterance) to integrate with generic embedding pipeline."""
-    db = await _get_db()
-    inserted = 0
+    """Create Chunk rows for embedding using token-based sliding-window chunking.
+
+    Strategy:
+    - Group consecutive utterances into chunks targeting SETTINGS.PROCESSING.CHUNK_TOKENS tokens.
+    - Apply overlap of SETTINGS.PROCESSING.CHUNK_OVERLAP_TOKENS tokens between chunks.
+    - For any single overlong utterance, split by sentence boundaries.
+    - Preserve metadata: speakers, roles, utterance_ids, and dominant section.
+    """
+    db = await DatabaseManager.get_resource()
     async with db.get_session() as session:
+        inserted = 0
+
+        target_tokens = getattr(SETTINGS.PROCESSING, "CHUNK_TOKENS", 400)
+        overlap_tokens = getattr(SETTINGS.PROCESSING, "CHUNK_OVERLAP_TOKENS", 80)
+        # Tokenizer helpers
+        enc = None
+        if tiktoken is not None:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                enc = None
+
+        def count_tokens(text: str) -> int:
+            if enc is not None:
+                try:
+                    return len(enc.encode(text))
+                except Exception:
+                    pass
+            return max(1, len(text.split()))
+
+        # Prepare LC splitter (token-based if possible; else character-based fallback ~4 chars per token)
+        if enc is not None:
+            splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+                chunk_size=target_tokens,
+                chunk_overlap=overlap_tokens,
+                separators=["\n\n", "\n", " ", ""],
+            )
+        else:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=target_tokens * 4,
+                chunk_overlap=overlap_tokens * 4,
+                separators=["\n\n", "\n", " ", ""],
+            )
+
         # Load utterances for document
         u_stmt = (
             select(UtteranceEntity)
@@ -674,45 +828,76 @@ async def materialize_transcript_chunks_from_pg(doc_id: str) -> Dict[str, Any]:
             return {"doc_id": doc_id, "chunks_inserted": 0}
 
         # Existing chunk hashes to avoid dupes
-        # We compute hash as sha256(doc_id|turn_index|speaker|speech)
-        existing_hashes: set[str] = set()
-        # To reduce queries, fetch existing chunk_hash for this doc
         from sqlalchemy import select as sa_select
 
         ex_stmt = sa_select(ChunkEntity.chunk_hash).where(
             ChunkEntity.document_id == doc_id
         )
         ex_res = await session.execute(ex_stmt)
-        existing_hashes = set(ex_res.scalars().all())
+        existing_hashes: set[str] = set(ex_res.scalars().all())
+
+        # Build contiguous section groups to preserve topical coherence
+        groups: List[Tuple[str, List[UtteranceEntity]]] = []
+        cur_section = None
+        cur_group: List[UtteranceEntity] = []
+        for u in utterances:
+            sec = u.section or "other"
+            if cur_section is None:
+                cur_section = sec
+            if sec != cur_section and cur_group:
+                groups.append((cur_section, cur_group))
+                cur_group = []
+                cur_section = sec
+            cur_group.append(u)
+        if cur_group:
+            groups.append((cur_section or "other", cur_group))
 
         seq = 0
-        for u in utterances:
-            content = u.speech or ""
-            content_norm = _normalize_text(content)
-            seq = u.turn_index
-            h_src = f"{doc_id}|{u.turn_index}|{u.speaker}|{content_norm}"
-            chash = hashlib.sha256(h_src.encode("utf-8")).hexdigest()
-            if chash in existing_hashes:
+        for section, group_utts in groups:
+            # Concatenate "Speaker: text" blocks with paragraph spacing
+            combined = []
+            speakers_in_group = []
+            utt_ids_in_group = []
+            for u in group_utts:
+                speech_norm = _normalize_text(u.speech or "")
+                if not speech_norm:
+                    continue
+                combined.append(f"{u.speaker}: {speech_norm}")
+                speakers_in_group.append(u.speaker)
+                utt_ids_in_group.append(u.utterance_id)
+            if not combined:
                 continue
-            # Approximate token count by whitespace tokens (MVP)
-            token_count = max(1, len(content_norm.split()))
-            chunk = ChunkEntity(
-                document_id=doc_id,
-                chunk_hash=chash,
-                chunk_type=ChunkTypeEnum.TEXT,
-                content=content,
-                content_normalized=content_norm,
-                page_number=None,
-                section_title=u.section or None,
-                sequence_number=seq,
-                token_count=token_count,
-                extra_metadata={
-                    "speaker": u.speaker,
-                    "role": u.role,
-                    "utterance_id": u.utterance_id,
-                },
-            )
-            session.add(chunk)
-            inserted += 1
+            text = "\n\n".join(combined)
+            parts = splitter.split_text(text)
+            for part in parts:
+                content = part.strip()
+                if not content:
+                    continue
+                content_norm = _normalize_text(content)
+                token_count = count_tokens(content_norm)
+                seq += 1
+                h_src = f"{doc_id}|{seq}|{section}|{content_norm}"
+                chash = hashlib.sha256(h_src.encode("utf-8")).hexdigest()
+                if chash in existing_hashes:
+                    continue
+                chunk = ChunkEntity(
+                    document_id=doc_id,
+                    chunk_hash=chash,
+                    chunk_type=ChunkTypeEnum.TEXT,
+                    content=content,
+                    content_normalized=content_norm,
+                    page_number=None,
+                    section_title=section,
+                    sequence_number=seq,
+                    token_count=token_count,
+                    extra_metadata={
+                        "speakers": list(dict.fromkeys(speakers_in_group)),
+                        "utterance_ids": utt_ids_in_group,
+                    },
+                )
+                session.add(chunk)
+                inserted += 1
+
         await session.commit()
+
     return {"doc_id": doc_id, "chunks_inserted": inserted}

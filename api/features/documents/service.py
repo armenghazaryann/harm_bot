@@ -1,308 +1,176 @@
-"""Service layer for the Documents feature."""
+"""Service layer for the Documents feature - refactored with repository pattern."""
 import logging
 from typing import List, Optional, Tuple
-from datetime import timedelta
 from uuid import UUID
+from io import BytesIO
+from datetime import timedelta
 
-from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.features.documents.exceptions import (
     DocumentNotFoundError,
-    DocumentStorageError,
-    DocumentAlreadyExistsError
+    DocumentAlreadyExistsError,
 )
-from api.features.documents.models import DocumentModel, DocumentCreateModel, DocumentUpdateModel
-from api.features.documents.entities.document import (
-    Document as DocumentEntity,
-    DocumentStatus,
+from api.features.documents.models import (
+    DocumentModel,
+    DocumentCreateModel,
+    DocumentUpdateModel,
 )
+from api.features.documents.entities.document import DocumentStatus, DocumentType
+from api.features.documents.repositories.document_repository import DocumentRepository
+from infra.resources import MinIOResource
 
 logger = logging.getLogger("rag.documents.service")
 
 
 class DocumentService:
-    """Service for document operations."""
-    
-    def __init__(self, storage_client=None):
+    """Service for document operations using repository pattern."""
+
+    def __init__(self, storage_client: MinIOResource):
         self.storage_client = storage_client
-    
+
     async def create_document(
-        self, 
-        create_model: DocumentCreateModel, 
-        db_session: AsyncSession
+        self, create_model: DocumentCreateModel, *, db_session: AsyncSession
     ) -> DocumentModel:
         """Create a new document."""
-        try:
-            # Check if document with same checksum already exists
-            existing = await self.get_document_by_checksum(create_model.checksum, db_session)
-            if existing:
-                raise DocumentAlreadyExistsError(create_model.checksum, "checksum")
-            
-            # Create entity
-            entity = create_model.to_entity()
-            db_session.add(entity)
-            await db_session.commit()
-            await db_session.refresh(entity)
-            
-            logger.info(f"Document created: {entity.id}")
-            return DocumentModel.from_entity(entity)
-            
-        except Exception as e:
-            await db_session.rollback()
-            logger.error(f"Failed to create document: {str(e)}")
-            raise
-    
-    async def get_document_by_id(
-        self, 
-        doc_id: UUID, 
-        db_session: AsyncSession
+        repository = DocumentRepository(db_session)
+
+        # Check if document with same checksum already exists
+        existing = await repository.get_by_checksum(create_model.checksum)
+        if existing:
+            raise DocumentAlreadyExistsError(create_model.checksum, "checksum")
+
+        # Create entity
+        entity = create_model.to_entity()
+        entity = await repository.create(entity)
+
+        logger.info(f"Document created: {entity.id}")
+        return DocumentModel.from_entity(entity)
+
+    async def get_document(
+        self, document_id: UUID, *, db_session: AsyncSession
     ) -> Optional[DocumentModel]:
         """Get document by ID."""
-        try:
-            stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
-            result = await db_session.execute(stmt)
-            entity = result.scalar_one_or_none()
-            
-            if entity:
-                return DocumentModel.from_entity(entity)
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to get document {doc_id}: {str(e)}")
-            raise
-    
+        repository = DocumentRepository(db_session)
+        entity = await repository.get_by_id(document_id)
+        return DocumentModel.from_entity(entity) if entity else None
+
     async def get_document_by_checksum(
-        self, 
-        checksum: str, 
-        db_session: AsyncSession
+        self, checksum: str, *, db_session: AsyncSession
     ) -> Optional[DocumentModel]:
         """Get document by checksum."""
-        try:
-            stmt = select(DocumentEntity).where(DocumentEntity.checksum == checksum)
-            result = await db_session.execute(stmt)
-            entity = result.scalar_one_or_none()
-            
-            if entity:
-                return DocumentModel.from_entity(entity)
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to get document by checksum {checksum}: {str(e)}")
-            raise
-    
+        repository = DocumentRepository(db_session)
+        entity = await repository.get_by_checksum(checksum)
+        return DocumentModel.from_entity(entity) if entity else None
+
+    async def list_documents(
+        self, offset: int, limit: int, *, db_session: AsyncSession
+    ) -> Tuple[List[DocumentModel], int]:
+        """List documents with pagination."""
+        repository = DocumentRepository(db_session)
+        entities, total = await repository.list(offset, limit, order_by="-created_at")
+        return [DocumentModel.from_entity(entity) for entity in entities], total
+
     async def update_document(
-        self, 
-        doc_id: UUID, 
-        update_model: DocumentUpdateModel, 
-        db_session: AsyncSession
+        self,
+        document_id: UUID,
+        update_model: DocumentUpdateModel,
+        *,
+        db_session: AsyncSession,
     ) -> DocumentModel:
         """Update document."""
-        try:
-            stmt = select(DocumentEntity).where(DocumentEntity.id == doc_id)
-            result = await db_session.execute(stmt)
-            entity = result.scalar_one_or_none()
-            
-            if not entity:
-                raise DocumentNotFoundError(str(doc_id))
-            
-            # Apply updates
-            entity = update_model.apply_to_entity(entity)
-            await db_session.commit()
-            await db_session.refresh(entity)
-            
-            logger.info(f"Document updated: {doc_id}")
-            return DocumentModel.from_entity(entity)
-            
-        except Exception as e:
-            await db_session.rollback()
-            logger.error(f"Failed to update document {doc_id}: {str(e)}")
-            raise
-    
-    async def list_documents(
-        self,
-        skip: int = 0,
-        limit: int = 100,
-        status_filter: Optional[str] = None,
-        db_session: AsyncSession = None
-    ) -> Tuple[List[DocumentModel], int]:
-        """List documents with pagination and filtering."""
-        try:
-            # Build query
-            stmt = select(DocumentEntity)
-            count_stmt = select(func.count(DocumentEntity.id))
-            
-            # Apply status filter
-            if status_filter:
-                try:
-                    status_enum = DocumentStatus(status_filter)
-                    stmt = stmt.where(DocumentEntity.status == status_enum)
-                    count_stmt = count_stmt.where(DocumentEntity.status == status_enum)
-                except ValueError:
-                    logger.warning(f"Invalid status filter: {status_filter}")
-            
-            # Apply pagination
-            stmt = stmt.offset(skip).limit(limit).order_by(DocumentEntity.created_at.desc())
-            
-            # Execute queries
-            result = await db_session.execute(stmt)
-            count_result = await db_session.execute(count_stmt)
-            
-            entities = result.scalars().all()
-            total = count_result.scalar()
-            
-            documents = [DocumentModel.from_entity(entity) for entity in entities]
-            
-            return documents, total
-            
-        except Exception as e:
-            logger.error(f"Failed to list documents: {str(e)}")
-            raise
-    
+        repository = DocumentRepository(db_session)
+
+        entity = await repository.get_by_id(document_id)
+        if not entity:
+            raise DocumentNotFoundError(f"Document {document_id} not found")
+
+        # Update fields from model
+        update_data = update_model.dict(exclude_unset=True)
+        entity = await repository.update_by_id(document_id, **update_data)
+
+        return DocumentModel.from_entity(entity)
+
+    async def update_document_status(
+        self, document_id: UUID, status: DocumentStatus, *, db_session: AsyncSession
+    ) -> DocumentModel:
+        """Update document status."""
+        repository = DocumentRepository(db_session)
+        entity = await repository.update_by_id(document_id, status=status)
+
+        if not entity:
+            raise DocumentNotFoundError(f"Document {document_id} not found")
+
+        return DocumentModel.from_entity(entity)
+
     async def delete_document(
-        self,
-        doc_id: UUID,
-        delete_chunks: bool = True,
-        delete_embeddings: bool = True,
-        db_session: AsyncSession = None
+        self, document_id: UUID, *, db_session: AsyncSession
     ) -> bool:
-        """Delete document and optionally associated data."""
+        """Delete document."""
+        repository = DocumentRepository(db_session)
+        return await repository.delete(document_id)
+
+    async def get_documents_by_status(
+        self,
+        status: DocumentStatus,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        db_session: AsyncSession,
+    ) -> List[DocumentModel]:
+        """Get documents by processing status."""
+        repository = DocumentRepository(db_session)
+        entities = await repository.get_by_status(status, offset=offset, limit=limit)
+        return [DocumentModel.from_entity(entity) for entity in entities]
+
+    async def get_documents_by_type(
+        self,
+        document_type: DocumentType,
+        *,
+        offset: int = 0,
+        limit: int = 100,
+        db_session: AsyncSession,
+    ) -> List[DocumentModel]:
+        """Get documents by type."""
+        repository = DocumentRepository(db_session)
+        entities = await repository.get_by_type(
+            document_type, offset=offset, limit=limit
+        )
+        return [DocumentModel.from_entity(entity) for entity in entities]
+
+    async def get_processing_stats(self, *, db_session: AsyncSession) -> dict:
+        """Get document processing statistics."""
+        repository = DocumentRepository(db_session)
+        return await repository.get_processing_stats()
+
+    # Storage methods
+    async def upload_to_storage(
+        self, storage_path: str, content: bytes, content_type: Optional[str] = None
+    ) -> None:
+        """Upload document to storage."""
         try:
-            # Check if document exists
-            document = await self.get_document_by_id(doc_id, db_session)
-            if not document:
-                return False
-            
-            # Delete from storage
-            if self.storage_client:
-                try:
-                    if document.storage_path:
-                        await self.delete_from_storage(document.storage_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete from storage: {str(e)}")
-            
-            # Delete associated chunks and embeddings if requested
-            if delete_chunks:
-                # TODO: Implement chunk deletion
-                pass
-            
-            if delete_embeddings:
-                # TODO: Implement embedding deletion
-                pass
-            
-            # Delete document entity
-            stmt = delete(DocumentEntity).where(DocumentEntity.id == doc_id)
-            await db_session.execute(stmt)
-            await db_session.commit()
-            
-            logger.info(f"Document deleted: {doc_id}")
-            return True
-            
-        except Exception as e:
-            await db_session.rollback()
-            logger.error(f"Failed to delete document {doc_id}: {str(e)}")
-            raise
-    
-    async def upload_to_storage(self, storage_path: str, content: bytes, content_type: Optional[str] = None) -> str:
-        """Upload document content to object storage.
-
-        Args:
-            storage_path: Object key/path to store the content under.
-            content: Bytes content of the file.
-            content_type: Optional MIME type.
-
-        Returns:
-            The storage path used.
-        """
-        try:
-            if not self.storage_client or getattr(self.storage_client, "client", None) is None:
-                raise DocumentStorageError("Storage client not configured")
-
-            client = self.storage_client.client
-            bucket = self.storage_client.bucket_name
-
-            # Upload bytes using put_object with a stream
-            import io
-
-            data_stream = io.BytesIO(content)
-            data_len = len(content)
-            client.put_object(
-                bucket_name=bucket,
+            # Wrap bytes in BytesIO for MinIO client compatibility
+            data_stream = BytesIO(content)
+            self.storage_client.client.put_object(
+                bucket_name=self.storage_client.bucket_name,
                 object_name=storage_path,
                 data=data_stream,
-                length=data_len,
+                length=len(content),
                 content_type=content_type or "application/octet-stream",
             )
-
-            logger.info(f"Uploaded to storage: {storage_path}")
-            return storage_path
-
+            logger.info(f"Uploaded document to storage: {storage_path}")
         except Exception as e:
-            logger.error(f"Failed to upload to storage {storage_path}: {str(e)}")
-            raise DocumentStorageError(f"Failed to upload document: {str(e)}")
-    
-    async def delete_from_storage(self, storage_path: str) -> bool:
-        """Delete document from object storage by path."""
+            logger.error(f"Failed to upload document: {e}")
+            raise
+
+    async def get_download_url(self, storage_path: str) -> str:
+        """Get download URL for document."""
         try:
-            if not self.storage_client or getattr(self.storage_client, "client", None) is None:
-                logger.warning("Storage client not configured, skipping storage deletion")
-                return True
-
-            client = self.storage_client.client
-            bucket = self.storage_client.bucket_name
-
-            client.remove_object(bucket, storage_path)
-
-            logger.info(f"Deleted from storage: {storage_path}")
-            return True
-
+            return self.storage_client.client.presigned_get_object(
+                bucket_name=self.storage_client.bucket_name,
+                object_name=storage_path,
+                expires=timedelta(hours=1),
+            )
         except Exception as e:
-            logger.error(f"Failed to delete from storage {storage_path}: {str(e)}")
-            raise DocumentStorageError(f"Failed to delete document from storage: {str(e)}")
-
-    async def get_download_url(self, storage_path: str, expires_seconds: int = 3600) -> Optional[str]:
-        """Generate a presigned GET URL for downloading the object.
-
-        Returns None if storage client not configured.
-        """
-        if not self.storage_client or getattr(self.storage_client, "client", None) is None:
-            return None
-        client = self.storage_client.client
-        bucket = self.storage_client.bucket_name
-        url = client.presigned_get_object(bucket, storage_path, expires=timedelta(seconds=expires_seconds))
-        return url
-    
-    async def get_document_stats(self, db_session: AsyncSession) -> dict:
-        """Get document statistics."""
-        try:
-            # Count documents by status
-            total_stmt = select(func.count(DocumentEntity.id))
-            processing_stmt = select(func.count(DocumentEntity.id)).where(
-                DocumentEntity.status == DocumentStatus.PROCESSING
-            )
-            completed_stmt = select(func.count(DocumentEntity.id)).where(
-                DocumentEntity.status == DocumentStatus.COMPLETED
-            )
-            failed_stmt = select(func.count(DocumentEntity.id)).where(
-                DocumentEntity.status == DocumentStatus.FAILED
-            )
-            
-            # Execute queries
-            total_result = await db_session.execute(total_stmt)
-            processing_result = await db_session.execute(processing_stmt)
-            completed_result = await db_session.execute(completed_stmt)
-            failed_result = await db_session.execute(failed_stmt)
-            
-            return {
-                "total_documents": total_result.scalar(),
-                "processing_documents": processing_result.scalar(),
-                "completed_documents": completed_result.scalar(),
-                "failed_documents": failed_result.scalar(),
-                "total_chunks": 0,  # TODO: Implement chunk counting
-                "total_embeddings": 0,  # TODO: Implement embedding counting
-                "storage_used_bytes": 0  # TODO: Implement storage usage calculation
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to get document stats: {str(e)}")
+            logger.error(f"Failed to get download URL: {e}")
             raise

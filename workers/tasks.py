@@ -6,13 +6,20 @@ from contextlib import contextmanager
 import redis
 import structlog
 from billiard.exceptions import SoftTimeLimitExceeded
+from celery import chain
 
 from core.settings import SETTINGS
 from .celery_app import app
-from api.di.container import DependencyContainer
+from workers.indexing import index_chunks_pgvector
+from workers.transcripts import (
+    create_utterances_jsonl,
+    ingest_transcript_pg_from_minio,
+    ingest_transcript_neo4j_from_minio,
+    materialize_transcript_chunks_from_pg,
+)
+from workers.embeddings import DocumentEmbedder
 
 log = structlog.get_logger()
-container = DependencyContainer()
 
 
 # Simple Redis-based idempotency guard using SET NX with TTL
@@ -54,7 +61,7 @@ def _run_step(self, idem_args: tuple, label: str, coro) -> dict:
             log.info(f"{label}.started", args=idem_args)
             result = asyncio.run(coro)
             if isinstance(result, dict):
-                log.info(f"{label}.finished", **result)
+                log.info(f"{label}.finished", result=result)
                 return result
             log.info(f"{label}.finished")
             return {"status": "done"}
@@ -77,13 +84,36 @@ def _run_step(self, idem_args: tuple, label: str, coro) -> dict:
     retry_kwargs={"max_retries": 5},
     soft_time_limit=600,
     time_limit=900,
+    queue="chunk",
 )
 def materialize_transcript_chunks_task(self, doc_id: str):
     result = _run_step(
         self,
         (doc_id,),
         "materialize_transcript_chunks",
-        container.transcript_materialize_chunks(doc_id),
+        materialize_transcript_chunks_from_pg(doc_id),
+    )
+    return {"doc_id": doc_id, **result}
+
+
+@app.task(
+    name="workers.tasks.index_pgvector",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=2,
+    retry_jitter=True,
+    retry_backoff_max=60,
+    retry_kwargs={"max_retries": 4},
+    soft_time_limit=300,
+    time_limit=600,
+    queue="index",
+)
+def index_pgvector(self, doc_id: str):
+    result = _run_step(
+        self,
+        (doc_id,),
+        "index_pgvector",
+        index_chunks_pgvector(doc_id),
     )
     return {"doc_id": doc_id, **result}
 
@@ -98,13 +128,14 @@ def materialize_transcript_chunks_task(self, doc_id: str):
     retry_kwargs={"max_retries": 5},
     soft_time_limit=600,
     time_limit=900,
+    queue="chunk",
 )
 def create_transcript_utterances_jsonl_task(self, doc_id: str):
     result = _run_step(
         self,
         (doc_id,),
         "create_transcript_utterances_jsonl",
-        container.transcript_create_jsonl(doc_id),
+        create_utterances_jsonl(doc_id),
     )
     return {"doc_id": doc_id, **result}
 
@@ -119,10 +150,14 @@ def create_transcript_utterances_jsonl_task(self, doc_id: str):
     retry_kwargs={"max_retries": 5},
     soft_time_limit=300,
     time_limit=600,
+    queue="ingest",
 )
 def ingest_transcript_pg_task(self, doc_id: str):
     result = _run_step(
-        self, (doc_id,), "ingest_transcript_pg", container.transcript_ingest_pg(doc_id)
+        self,
+        (doc_id,),
+        "ingest_transcript_pg",
+        ingest_transcript_pg_from_minio(doc_id),
     )
     return {"doc_id": doc_id, **result}
 
@@ -137,13 +172,14 @@ def ingest_transcript_pg_task(self, doc_id: str):
     retry_kwargs={"max_retries": 5},
     soft_time_limit=300,
     time_limit=600,
+    queue="ingest",
 )
 def ingest_transcript_neo4j_task(self, doc_id: str):
     result = _run_step(
         self,
         (doc_id,),
         "ingest_transcript_neo4j",
-        container.transcript_ingest_neo4j(doc_id),
+        ingest_transcript_neo4j_from_minio(doc_id),
     )
     return {"doc_id": doc_id, **result}
 
@@ -158,21 +194,27 @@ def ingest_transcript_neo4j_task(self, doc_id: str):
     retry_kwargs={"max_retries": 3},
     soft_time_limit=1200,
     time_limit=1500,
+    queue="ingest",
 )
 def process_transcript_pipeline(self, doc_id: str):
-    """Orchestrate JSONL creation -> Postgres ingest -> Neo4j ingest.
-
-    Uses synchronous calls to async functions for simplicity in MVP.
-    """
-    # Orchestrate the three async steps sequentially; no idempotency guard here to allow Celery autoretry
+    """Schedule a distributed Celery chain for the transcript pipeline and return immediately."""
     try:
-        log.info("process_transcript_pipeline.started", doc_id=doc_id)
-        r1 = asyncio.run(container.transcript_create_jsonl(doc_id))
-        r2 = asyncio.run(container.transcript_ingest_pg(doc_id))
-        r3 = asyncio.run(container.transcript_ingest_neo4j(doc_id))
-        result = {**r1, **r2, **r3}
-        log.info("process_transcript_pipeline.finished", doc_id=doc_id, **result)
-        return result
+        log.info("process_transcript_pipeline.schedule", doc_id=doc_id)
+        ch = chain(
+            create_transcript_utterances_jsonl_task.si(doc_id),
+            ingest_transcript_pg_task.si(doc_id),
+            ingest_transcript_neo4j_task.si(doc_id),
+            materialize_transcript_chunks_task.si(doc_id),
+            index_pgvector.si(doc_id),
+            create_pgvector_hnsw_index_task.si(),
+        )
+        async_result = ch.apply_async()
+        log.info(
+            "process_transcript_pipeline.scheduled",
+            doc_id=doc_id,
+            chain_id=async_result.id,
+        )
+        return {"doc_id": doc_id, "status": "scheduled", "chain_id": async_result.id}
     except SoftTimeLimitExceeded as e:
         log.warning(
             "process_transcript_pipeline.soft_time_limit_exceeded", doc_id=doc_id
@@ -195,9 +237,34 @@ def process_transcript_pipeline(self, doc_id: str):
     retry_kwargs={"max_retries": 4},
     soft_time_limit=120,
     time_limit=180,
+    queue="embed",
 )
 def embed_chunks(self, doc_id: str):
     result = _run_step(
-        self, (doc_id,), "embed_chunks", container.embed_document_chunks(doc_id)
+        self,
+        (doc_id,),
+        "embed_chunks",
+        DocumentEmbedder().embed_document_chunks(doc_id),
     )
     return {"doc_id": doc_id, **result}
+
+
+@app.task(
+    name="workers.tasks.create_pgvector_hnsw_index",
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=2,
+    retry_jitter=True,
+    retry_backoff_max=120,
+    retry_kwargs={"max_retries": 3},
+    soft_time_limit=300,
+    time_limit=600,
+    queue="index",
+)
+def create_pgvector_hnsw_index_task(self):
+    """Create HNSW index on embeddings table - DISABLED for LangChain PGVector."""
+    log.info(
+        "create_pgvector_hnsw_index.skipped",
+        reason="Using LangChain PGVector instead of custom embeddings table",
+    )
+    return {"status": "skipped", "reason": "Using LangChain PGVector"}

@@ -23,11 +23,14 @@ app.conf.update(
         # Transcript pipeline (distributed MVP)
         "workers.tasks.create_transcript_utterances_jsonl": {"queue": "chunk"},
         "workers.tasks.ingest_transcript_pg": {"queue": "ingest"},
-        "workers.tasks.ingest_transcript_neo4j": {"queue": "index"},
+        "workers.tasks.ingest_transcript_neo4j": {"queue": "ingest"},
         "workers.tasks.materialize_transcript_chunks": {"queue": "chunk"},
         "workers.tasks.process_transcript_pipeline": {"queue": "ingest"},
         # Embedding
         "workers.tasks.embed_chunks": {"queue": "embed"},
+        # Vector indexing
+        "workers.tasks.index_pgvector": {"queue": "index"},
+        "workers.tasks.create_pgvector_hnsw_index": {"queue": "index"},
     },
     # Reliability defaults
     task_acks_late=True,

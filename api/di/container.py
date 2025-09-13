@@ -1,3 +1,4 @@
+"""Centralized dependency injection container following SOLID principles."""
 import structlog
 from dependency_injector import containers, providers
 
@@ -13,38 +14,17 @@ from infra.resources import (
 logger = structlog.get_logger("rag")
 
 
-class DependencyContainer(containers.DeclarativeContainer):
-    """Centralized dependency injection container."""
+class InfrastructureContainer(containers.DeclarativeContainer):
+    """Infrastructure layer dependencies - follows Single Responsibility Principle."""
 
     config = providers.Configuration()
-
-    wiring_config = containers.WiringConfiguration(
-        modules=[
-            "api.main",
-            "api.features.documents.controller",
-            "api.features.documents.router",
-            "api.features.query.controller",
-            "api.features.query.router",
-            "api.features.jobs.controller",
-            "api.features.jobs.router",
-        ]
-    )
-
-    # Configuration
     settings = providers.Object(SETTINGS)
-
-    # Logging
     logger = providers.Object(logger)
 
     # Database
     database = providers.Resource(
         DatabaseResource,
         database_url=str(SETTINGS.DATABASE.DATABASE_URL),
-    )
-
-    db_session = providers.Factory(
-        lambda db: db.get_session(),
-        db=database,
     )
 
     # Redis
@@ -70,27 +50,37 @@ class DependencyContainer(containers.DeclarativeContainer):
         password=SETTINGS.NEO4J.NEO4J_PASSWORD.get_secret_value(),
     )
 
+
+class ServiceContainer(containers.DeclarativeContainer):
+    """Application services - depends on infrastructure."""
+
+    infrastructure = providers.DependenciesContainer()
+
+    # Database session factory
+    db_session = providers.Factory(
+        lambda db: db.get_session(),
+        db=infrastructure.database,
+    )
+
     # Services
     document_service = providers.Factory(
         "api.features.documents.service.DocumentService",
-        storage_client=minio_client,
+        storage_client=infrastructure.minio_client,
     )
 
     query_service = providers.Factory(
         "api.features.query.service.QueryService",
-        embedding_client=None,  # TODO: Add embedding client
-        llm_client=None,  # TODO: Add LLM client
+        embedding_client=None,
+        llm_client=None,
     )
 
-    job_service = providers.Factory(
-        "api.features.jobs.service.JobService",
-        celery_app=None,  # TODO: Add Celery app
-    )
 
-    # Workers: Transcript pipeline callables
-    transcript_process = providers.Callable(
-        "workers.transcripts.process_transcript_document"
-    )
+class WorkerContainer(containers.DeclarativeContainer):
+    """Worker-specific dependencies."""
+
+    infrastructure = providers.DependenciesContainer()
+
+    # Worker tasks
     transcript_create_jsonl = providers.Callable(
         "workers.transcripts.create_utterances_jsonl"
     )
@@ -109,14 +99,41 @@ class DependencyContainer(containers.DeclarativeContainer):
         "workers.embeddings.embed_document_chunks"
     )
 
+    # Workers: Indexing with LangChain VectorStore (PGVector)
+    indexing_pgvector = providers.Callable("workers.indexing.index_chunks_pgvector")
+
+
+class ControllerContainer(containers.DeclarativeContainer):
+    """Controller-specific dependencies."""
+
+    services = providers.DependenciesContainer()
+
     # Controllers
     document_controller = providers.Factory(
         "api.features.documents.controller.DocumentController",
-        document_service=document_service,
+        document_service=services.document_service,
     )
 
     query_controller = providers.Factory(
-        "api.features.query.controller.QueryController"
+        "api.features.query.controller.QueryController",
+        query_service=services.query_service,
     )
 
-    job_controller = providers.Factory("api.features.jobs.controller.JobController")
+
+class ApplicationContainer(containers.DeclarativeContainer):
+    """Main application container composing all sub-containers."""
+
+    wiring_config = containers.WiringConfiguration(
+        modules=[
+            "api.main",
+            "api.features.documents.controller",
+            "api.features.documents.router",
+            "api.features.query.controller",
+            "api.features.query.router",
+        ]
+    )
+
+    infrastructure = providers.Container(InfrastructureContainer)
+    services = providers.Container(ServiceContainer, infrastructure=infrastructure)
+    workers = providers.Container(WorkerContainer, infrastructure=infrastructure)
+    controllers = providers.Container(ControllerContainer, services=services)

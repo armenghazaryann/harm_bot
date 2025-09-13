@@ -1,301 +1,247 @@
-"""Service layer for the Query feature."""
+"""Service layer for the Query feature using LangChain retrievers and PGVector."""
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from uuid import UUID
+from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.features.query.exceptions import (
     SearchError,
-    EmbeddingError,
     AnswerGenerationError,
-    NoResultsError,
-    InsufficientContextError
+    InsufficientContextError,
 )
 from api.features.query.models import (
     ChunkModel,
-    EmbeddingModel,
     SearchResultModel,
     QueryContextModel,
-    AnswerModel
+    AnswerModel,
 )
 from api.features.query.entities.chunk import Chunk as ChunkEntity
-from api.features.query.entities.embedding import Embedding as EmbeddingEntity
-from api.features.documents.entities.document import Document as DocumentEntity, DocumentStatus, DocumentType
+from api.features.query.retrievers import vector_search, fts_search
 
 logger = logging.getLogger("rag.query.service")
 
 
 class QueryService:
     """Service for query and search operations."""
-    
+
     def __init__(self, embedding_client=None, llm_client=None):
+        # embedding_client is unused now; using LangChain inside retrievers.
         self.embedding_client = embedding_client
         self.llm_client = llm_client
-    
+
     async def semantic_search(
         self,
         query: str,
         top_k: int = 10,
-        similarity_threshold: float = 0.7,
         document_filters: Optional[List[UUID]] = None,
-        db_session: AsyncSession = None
+        db_session: AsyncSession = None,
+        collection: str = "rag_chunks_v1",
     ) -> QueryContextModel:
-        """Perform semantic search using vector similarity."""
+        """Semantic search via LangChain PGVector."""
         start_time = time.time()
-        
         try:
-            # Generate query embedding
-            if not self.embedding_client:
-                raise EmbeddingError("Embedding client not configured")
-            
-            # TODO: Implement actual embedding generation
-            query_embedding = await self._generate_embedding(query)
-            
-            # Build search query
-            search_query = """
-            SELECT 
-                c.id as chunk_id,
-                c.document_id,
-                c.content,
-                c.position,
-                c.metadata,
-                c.created_at,
-                d.filename,
-                e.vector <=> %s as distance
-            FROM chunks c
-            JOIN embeddings e ON c.id = e.chunk_id
-            JOIN documents d ON c.document_id = d.id
-            WHERE e.vector <=> %s < %s
-            """
-            
-            params = [query_embedding, query_embedding, 1.0 - similarity_threshold]
-            
-            # Add document filters
-            if document_filters:
-                placeholders = ','.join(['%s'] * len(document_filters))
-                search_query += f" AND c.document_id IN ({placeholders})"
-                params.extend([str(doc_id) for doc_id in document_filters])
-            
-            search_query += " ORDER BY distance LIMIT %s"
-            params.append(top_k)
-            
-            # Execute search
-            result = await db_session.execute(text(search_query), params)
-            rows = result.fetchall()
-            
-            # Convert to models
-            search_results = []
-            for i, row in enumerate(rows):
-                chunk = ChunkModel(
-                    id=row.chunk_id,
-                    document_id=row.document_id,
-                    content=row.content,
-                    position=row.position,
-                    metadata=row.metadata or {},
-                    created_at=row.created_at
+            pairs = vector_search(query, top_k=top_k, collection=collection)
+            # Extract chunk_ids from metadata and batch-load entities
+            chunk_ids: List[str] = []
+            raw_items: List[Tuple[Dict, float]] = []
+            for doc, score in pairs:
+                meta = doc.metadata or {}
+                cid = meta.get("chunk_id")
+                if not cid:
+                    continue
+                if document_filters and meta.get("doc_id") not in {
+                    str(d) for d in document_filters
+                }:
+                    continue
+                chunk_ids.append(cid)
+                raw_items.append((meta, float(score)))
+            ent_map: Dict[str, ChunkEntity] = {}
+            if chunk_ids and db_session is not None:
+                q = select(ChunkEntity).where(ChunkEntity.id.in_(chunk_ids))
+                res = await db_session.execute(q)
+                for ent in res.scalars().all():
+                    ent_map[str(ent.id)] = ent
+            # Build results
+            results: List[SearchResultModel] = []
+            for rank, (meta, score) in enumerate(raw_items, start=1):
+                ent = ent_map.get(meta.get("chunk_id"))
+                if not ent:
+                    # Fallback to lightweight model using metadata
+                    doc_fn = meta.get("document_filename", "")
+                    cm = ChunkModel(
+                        id=UUID(meta.get("chunk_id")),
+                        document_id=UUID(meta.get("doc_id")),
+                        content="",  # will be empty without DB entity
+                        position=int(meta.get("sequence", 0)),
+                        metadata={},
+                        created_at=datetime.fromtimestamp(
+                            0, tz=timezone.utc
+                        ),  # placeholder
+                    )
+                else:
+                    cm = ChunkModel.from_entity(ent)
+                    doc_fn = meta.get("document_filename", "")
+                results.append(
+                    SearchResultModel(
+                        chunk=cm,
+                        score=float(score),
+                        document_filename=doc_fn,
+                        rank=rank,
+                    )
                 )
-                
-                search_result = SearchResultModel(
-                    chunk=chunk,
-                    score=1.0 - row.distance,  # Convert distance to similarity score
-                    document_filename=row.filename,
-                    rank=i + 1
-                )
-                search_results.append(search_result)
-            
             processing_time = (time.time() - start_time) * 1000
-            
             return QueryContextModel(
                 query=query,
-                search_results=search_results,
-                total_results=len(search_results),
+                search_results=results,
+                total_results=len(results),
                 processing_time_ms=processing_time,
-                search_type="semantic"
+                search_type="semantic",
             )
-            
         except Exception as e:
-            logger.error(f"Semantic search failed: {str(e)}")
-            raise SearchError(f"Semantic search failed: {str(e)}")
-    
+            logger.error(f"Semantic search failed: {e}")
+            raise SearchError(f"Semantic search failed: {e}")
+
     async def keyword_search(
         self,
         query: str,
         top_k: int = 10,
-        use_stemming: bool = True,
-        use_fuzzy: bool = False,
-        db_session: AsyncSession = None
+        db_session: AsyncSession = None,
     ) -> QueryContextModel:
-        """Perform keyword search using full-text search."""
+        """Perform keyword search using Postgres FTS."""
         start_time = time.time()
-        
         try:
-            # Build FTS query
-            search_query = """
-            SELECT 
-                c.id as chunk_id,
-                c.document_id,
-                c.content,
-                c.position,
-                c.metadata,
-                c.created_at,
-                d.filename,
-                ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', %s)) as rank
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE to_tsvector('english', c.content) @@ plainto_tsquery('english', %s)
-            ORDER BY rank DESC
-            LIMIT %s
-            """
-            
-            params = [query, query, top_k]
-            
-            # Execute search
-            result = await db_session.execute(text(search_query), params)
-            rows = result.fetchall()
-            
-            # Convert to models
-            search_results = []
-            for i, row in enumerate(rows):
-                chunk = ChunkModel(
-                    id=row.chunk_id,
-                    document_id=row.document_id,
-                    content=row.content,
-                    position=row.position,
-                    metadata=row.metadata or {},
-                    created_at=row.created_at
+            pairs = await fts_search(db_session, query, top_k=top_k)
+            # Load chunk entities for created_at and full content
+            chunk_ids = [
+                p[0].metadata.get("chunk_id")
+                for p in pairs
+                if p[0].metadata.get("chunk_id")
+            ]
+            ent_map: Dict[str, ChunkEntity] = {}
+            if chunk_ids:
+                q = select(ChunkEntity).where(ChunkEntity.id.in_(chunk_ids))
+                res = await db_session.execute(q)
+                for ent in res.scalars().all():
+                    ent_map[str(ent.id)] = ent
+            results: List[SearchResultModel] = []
+            for rank, (doc, score) in enumerate(pairs, start=1):
+                meta = doc.metadata or {}
+                ent = ent_map.get(meta.get("chunk_id", ""))
+                if ent:
+                    cm = ChunkModel.from_entity(ent)
+                    filename = meta.get("document_filename", "")
+                else:
+                    # Fallback minimal
+                    cm = ChunkModel(
+                        id=UUID(meta.get("chunk_id")),
+                        document_id=UUID(meta.get("doc_id")),
+                        content=doc.page_content,
+                        position=int(meta.get("sequence", 0)),
+                        metadata={},
+                        created_at=datetime.fromtimestamp(0, tz=timezone.utc),
+                    )
+                    filename = meta.get("document_filename", "")
+                results.append(
+                    SearchResultModel(
+                        chunk=cm,
+                        score=float(score),
+                        document_filename=filename,
+                        rank=rank,
+                    )
                 )
-                
-                search_result = SearchResultModel(
-                    chunk=chunk,
-                    score=float(row.rank),
-                    document_filename=row.filename,
-                    rank=i + 1
-                )
-                search_results.append(search_result)
-            
             processing_time = (time.time() - start_time) * 1000
-            
             return QueryContextModel(
                 query=query,
-                search_results=search_results,
-                total_results=len(search_results),
+                search_results=results,
+                total_results=len(results),
                 processing_time_ms=processing_time,
-                search_type="keyword"
+                search_type="keyword",
             )
-            
         except Exception as e:
-            logger.error(f"Keyword search failed: {str(e)}")
-            raise SearchError(f"Keyword search failed: {str(e)}")
-    
+            logger.error(f"Keyword search failed: {e}")
+            raise SearchError(f"Keyword search failed: {e}")
+
     async def hybrid_search(
         self,
         query: str,
         top_k: int = 10,
         semantic_weight: float = 0.7,
         keyword_weight: float = 0.3,
-        db_session: AsyncSession = None
+        db_session: AsyncSession = None,
     ) -> QueryContextModel:
-        """Perform hybrid search combining semantic and keyword search."""
+        """Perform hybrid search combining vector and FTS (BM25-ish) using weighted fusion."""
         start_time = time.time()
-        
         try:
-            # Perform both searches
-            semantic_results = await self.semantic_search(
-                query=query,
-                top_k=top_k * 2,  # Get more results for better fusion
-                db_session=db_session
+            sem = await self.semantic_search(
+                query=query, top_k=top_k * 2, db_session=db_session
             )
-            
-            keyword_results = await self.keyword_search(
-                query=query,
-                top_k=top_k * 2,
-                db_session=db_session
+            kw = await self.keyword_search(
+                query=query, top_k=top_k * 2, db_session=db_session
             )
-            
-            # Combine and re-rank results using weighted scores
-            combined_results = {}
-            
-            # Add semantic results
-            for result in semantic_results.search_results:
-                chunk_id = str(result.chunk.id)
-                combined_results[chunk_id] = {
-                    'result': result,
-                    'semantic_score': result.score,
-                    'keyword_score': 0.0
-                }
-            
-            # Add keyword results
-            for result in keyword_results.search_results:
-                chunk_id = str(result.chunk.id)
-                if chunk_id in combined_results:
-                    combined_results[chunk_id]['keyword_score'] = result.score
+            combined: Dict[str, Dict[str, float]] = {}
+            selection: Dict[str, SearchResultModel] = {}
+            for r in sem.search_results:
+                cid = str(r.chunk.id)
+                combined[cid] = {"sem": r.score, "kw": 0.0}
+                selection[cid] = r
+            for r in kw.search_results:
+                cid = str(r.chunk.id)
+                if cid in combined:
+                    combined[cid]["kw"] = r.score
+                    # keep existing selection (from sem)
                 else:
-                    combined_results[chunk_id] = {
-                        'result': result,
-                        'semantic_score': 0.0,
-                        'keyword_score': result.score
-                    }
-            
-            # Calculate hybrid scores and sort
-            hybrid_results = []
-            for chunk_id, data in combined_results.items():
-                hybrid_score = (
-                    semantic_weight * data['semantic_score'] +
-                    keyword_weight * data['keyword_score']
-                )
-                
-                result = data['result']
-                result.score = hybrid_score
-                hybrid_results.append(result)
-            
-            # Sort by hybrid score and take top_k
-            hybrid_results.sort(key=lambda x: x.score, reverse=True)
-            final_results = hybrid_results[:top_k]
-            
-            # Update ranks
-            for i, result in enumerate(final_results):
-                result.rank = i + 1
-            
+                    combined[cid] = {"sem": 0.0, "kw": r.score}
+                    selection[cid] = r
+            fused: List[SearchResultModel] = []
+            for cid, scores in combined.items():
+                sc = semantic_weight * scores["sem"] + keyword_weight * scores["kw"]
+                item = selection[cid]
+                item.score = sc
+                fused.append(item)
+            fused.sort(key=lambda x: x.score, reverse=True)
+            final_results = fused[:top_k]
+            for i, r in enumerate(final_results):
+                r.rank = i + 1
             processing_time = (time.time() - start_time) * 1000
-            
             return QueryContextModel(
                 query=query,
                 search_results=final_results,
                 total_results=len(final_results),
                 processing_time_ms=processing_time,
-                search_type="hybrid"
+                search_type="hybrid",
             )
-            
         except Exception as e:
-            logger.error(f"Hybrid search failed: {str(e)}")
-            raise SearchError(f"Hybrid search failed: {str(e)}")
-    
+            logger.error(f"Hybrid search failed: {e}")
+            raise SearchError(f"Hybrid search failed: {e}")
+
     async def generate_answer(
         self,
         question: str,
         context: QueryContextModel,
         max_tokens: int = 500,
         temperature: float = 0.1,
-        model: str = "gpt-3.5-turbo"
+        model: str = "gpt-3.5-turbo",
     ) -> AnswerModel:
         """Generate an answer using RAG."""
         start_time = time.time()
-        
+
         try:
             if not self.llm_client:
-                raise AnswerGenerationError("LLM client not configured", model)
-            
+                # Keep working with a mock to avoid overengineering LLM selection here
+                pass
+
             if not context.search_results:
                 raise InsufficientContextError(1, 0)
-            
+
             # Build context from search results
             context_text = context.get_context_text(max_chunks=5)
-            
+
             # Create prompt
-            prompt = f"""Based on the following context, answer the question. If the answer cannot be found in the context, say so clearly.
+            _ = f"""Based on the following context, answer the question. If the answer cannot be found in the context, say so clearly.
 
 Context:
 {context_text}
@@ -303,31 +249,27 @@ Context:
 Question: {question}
 
 Answer:"""
-            
-            # TODO: Implement actual LLM call
-            # For now, return a mock answer
-            answer = f"This is a mock answer for the question: '{question}'. In a real implementation, this would be generated by an LLM using the provided context."
-            
+
+            # TODO: Plug in ChatOpenAI (LangChain) later. For now keep mock.
+            answer = f"This is a mock answer for: '{question}'. A production path would call an LLM with the retrieved context."
+
             generation_time = (time.time() - start_time) * 1000
-            
+
             return AnswerModel(
                 question=question,
                 answer=answer,
                 context=context,
                 confidence_score=0.85,  # Mock confidence score
                 model_used=model,
-                generation_time_ms=generation_time
+                generation_time_ms=generation_time,
             )
-            
+
         except Exception as e:
-            logger.error(f"Answer generation failed: {str(e)}")
+            logger.error(f"Answer generation failed: {e}")
             raise AnswerGenerationError(str(e), model)
-    
+
     async def get_query_suggestions(
-        self,
-        prefix: str = "",
-        limit: int = 10,
-        db_session: AsyncSession = None
+        self, prefix: str = "", limit: int = 10, db_session: AsyncSession = None
     ) -> List[str]:
         """Get query suggestions based on prefix and popular queries."""
         try:
@@ -341,26 +283,19 @@ Answer:"""
                 "What were the main highlights?",
                 "How much cash does the company have?",
                 "What are the growth drivers?",
-                "What challenges does the company face?"
+                "What challenges does the company face?",
             ]
-            
+
             # Filter by prefix if provided
             if prefix:
-                suggestions = [s for s in suggestions if s.lower().startswith(prefix.lower())]
-            
+                suggestions = [
+                    s for s in suggestions if s.lower().startswith(prefix.lower())
+                ]
+
             return suggestions[:limit]
-            
+
         except Exception as e:
             logger.error(f"Failed to get query suggestions: {str(e)}")
             raise SearchError(f"Failed to get suggestions: {str(e)}")
-    
-    async def _generate_embedding(self, text: str) -> List[float]:
-        """Generate embedding for text."""
-        try:
-            # TODO: Implement actual embedding generation
-            # For now, return a mock embedding
-            return [0.1] * 1536  # Mock OpenAI embedding dimension
-            
-        except Exception as e:
-            logger.error(f"Failed to generate embedding: {str(e)}")
-            raise EmbeddingError(f"Failed to generate embedding: {str(e)}")
+
+    # Note: No direct embedding generation here; retrievers handle embeddings via LangChain.

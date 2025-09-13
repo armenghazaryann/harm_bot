@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class CustomSettings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=".env.docker",
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore",
@@ -97,6 +97,9 @@ class ProcessingSettings(CustomSettings):
     EMBED_BATCH_SIZE: int = Field(default=128)
     MAX_CONCURRENCY: int = Field(default=4)
     TOLERANCE_REL: float = Field(default=0.001)
+    # Chunking configuration for LangChain splitters (token-based if tiktoken available)
+    CHUNK_TOKENS: int = Field(default=512)
+    CHUNK_OVERLAP_TOKENS: int = Field(default=80)
 
 
 class Settings(BaseModel):
