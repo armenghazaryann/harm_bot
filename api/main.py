@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic_core import _pydantic_core
 from sqlalchemy import text
@@ -156,30 +157,42 @@ async def ready():
 # Exception handlers
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: HTTPException):
-    return {
-        "error": "Not Found",
-        "detail": f"{exc.detail} : {request.url}",
-        "status_code": 404,
-    }
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "Not Found",
+            "detail": f"{exc.detail} : {request.url}",
+            "status_code": 404,
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return {"error": "Validation Error", "detail": str(exc), "status_code": 422}
+    return JSONResponse(
+        status_code=422,
+        content={"error": "Validation Error", "detail": str(exc), "status_code": 422},
+    )
 
 
 @app.exception_handler(_pydantic_core.ValidationError)
 async def pydantic_validation_handler(
     request: Request, exc: _pydantic_core.ValidationError
 ):
-    return {"error": "Validation Error", "detail": str(exc), "status_code": 422}
+    return JSONResponse(
+        status_code=422,
+        content={"error": "Validation Error", "detail": str(exc), "status_code": 422},
+    )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception", str(exc))
-    return {
-        "error": "Internal Server Error",
-        "detail": "An unexpected error occurred",
-        "status_code": 500,
-    }
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "detail": "An unexpected error occurred",
+            "status_code": 500,
+        },
+    )

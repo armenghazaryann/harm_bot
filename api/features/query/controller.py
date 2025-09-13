@@ -269,9 +269,10 @@ class QueryController:
         try:
             # Use LangChain RetrievalQA with hybrid search for answer generation
             result = await query_documents(
-                query=request.question,
+                question=request.question,
                 doc_id=None,  # Search across all documents
                 k=request.context_limit,
+                search_type="hybrid",
             )
 
             if not result.get("answer"):
@@ -279,23 +280,37 @@ class QueryController:
 
             # Convert LangChain result to AnswerResponse format
             source_documents = result.get("source_documents", [])
-            sources = [
-                {
-                    "document_id": doc.metadata.get("doc_id"),
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                }
-                for doc in source_documents
-            ]
+            # Map to required citations DTO
+            citations = []
+            import uuid as _uuid  # local import scoped to function
+
+            for doc in source_documents:
+                md = doc.metadata or {}
+                citations.append(
+                    {
+                        "chunk_id": md.get("chunk_id")
+                        or md.get("id")
+                        or str(_uuid.uuid4()),
+                        "document_id": md.get("doc_id") or str(_uuid.uuid4()),
+                        "document_filename": md.get("document_filename")
+                        or (md.get("source") or ""),
+                        "content_excerpt": (doc.page_content or "")[:500],
+                        "relevance_score": float(md.get("score", 0.0)),
+                        "page_number": md.get("page_number"),
+                    }
+                )
 
             response_data = AnswerResponse(
                 question=request.question,
-                answer=result["answer"],
-                sources=sources,
-                confidence_score=0.85,  # TODO: Add confidence scoring to LangChain service
-                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
-                model_used="gpt-4-turbo",
-                context_used=len(source_documents),
+                answer=result.get("answer", ""),
+                citations=citations,
+                confidence_score=float(result.get("confidence_score", 0.85)),
+                processing_time_ms=float(
+                    (result.get("performance_metrics", {}) or {}).get(
+                        "processing_time_ms", 0.0
+                    )
+                ),
+                model_used="gpt-4o",
             )
 
             logger.info(f"Answer generated for question: '{request.question}'")
