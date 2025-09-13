@@ -276,6 +276,7 @@ class QueryController:
                 doc_id=None,  # Search across all documents
                 k=request.context_limit,
                 search_type="hybrid",
+                detailed=True,  # Enable Self-RAG Lite path by default
             )
 
             # Propagate backend errors properly
@@ -317,7 +318,9 @@ class QueryController:
                         "processing_time_ms", 0.0
                     )
                 ),
-                model_used="gpt-4o",
+                model_used=str(result.get("model_used", "gpt-4o")),
+                verification_report=result.get("verification_report", {}),
+                retrieval_diagnostics=result.get("retrieval_diagnostics", {}),
             )
 
             logger.info(f"Answer generated for question: '{request.question}'")

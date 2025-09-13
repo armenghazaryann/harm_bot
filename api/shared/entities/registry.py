@@ -14,4 +14,4 @@ from api.features.documents.entities.document import Document  # noqa: F401
 # from api.features.query.entities.utterance import Utterance  # DEPRECATED: → LangChain Document objects
 
 # Feature: Jobs
-from api.features.jobs.entities.job import Job  # noqa: F401
+# from api.features.jobs.entities.job import Job  # noqa: F401

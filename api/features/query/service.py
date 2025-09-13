@@ -9,11 +9,16 @@ Also retains a minimal `QueryService` class for suggestions to satisfy DI.
 import asyncio
 import logging
 import time
+import json
+import re
+from collections import defaultdict
+from hashlib import md5
 from enum import Enum
 from functools import wraps
 from typing import Any, Dict, List, Optional
 
 import structlog
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.features.query.exceptions import SearchError
@@ -173,6 +178,404 @@ class LangChainQueryService:
         self.document_content_description = (
             "Document chunks from processed PDFs containing text content"
         )
+
+    # ---------------- Self-RAG Lite helpers ----------------
+    def _safe_json(self, text: str) -> Optional[Dict[str, Any]]:
+        try:
+            return json.loads(text)
+        except Exception:
+            # Try to extract the first JSON object/array present
+            try:
+                m = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+                if m:
+                    return json.loads(m.group(1))
+            except Exception:
+                return None
+        return None
+
+    def _doc_key(self, d: Document) -> str:
+        md = d.metadata or {}
+        cid = md.get("chunk_id") or md.get("id") or ""
+        did = md.get("doc_id") or ""
+        if cid or did:
+            return f"{did}:{cid}"
+        # fallback to content hash
+        return md5((d.page_content or "").encode("utf-8")).hexdigest()
+
+    async def _classify_retrieval_needed(self, question: str) -> Dict[str, Any]:
+        prompt = (
+            "Decide if external retrieval is needed to answer the question factually.\n"
+            'Return JSON only: {"retrieval_needed": true|false, "reason": "short"}.\n'
+            f"Question: {question}\n"
+        )
+        out = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.llm.predict(prompt)
+        )
+        js = self._safe_json(out) or {}
+        needed = bool(js.get("retrieval_needed", True))
+        return {"retrieval_needed": needed, "raw": out, "parsed": js}
+
+    async def _grade_document(self, question: str, doc: Document) -> Dict[str, Any]:
+        # Truncate for safety
+        text = (doc.page_content or "")[:2000]
+        prompt = (
+            "You are grading a document chunk for answering a question.\n"
+            "Grade in [0..1] the following: relevance, supportiveness, usefulness.\n"
+            'JSON only: {"relevance": n, "supportiveness": n, "usefulness": n, "rationale": "short"}.\n'
+            f"Question: {question}\nChunk: {text}\n"
+        )
+        out = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.llm.predict(prompt)
+        )
+        js = self._safe_json(out) or {}
+        rel = float(js.get("relevance", 0))
+        sup = float(js.get("supportiveness", 0))
+        use = float(js.get("usefulness", 0))
+        score = rel + sup + 0.5 * use
+        return {
+            "doc": doc,
+            "relevance": rel,
+            "supportiveness": sup,
+            "usefulness": use,
+            "score": score,
+            "raw": out,
+        }
+
+    async def _grade_documents(
+        self, question: str, docs: List[Document]
+    ) -> List[Dict[str, Any]]:
+        graded: List[Dict[str, Any]] = []
+        for d in docs:
+            try:
+                g = await self._grade_document(question, d)
+                graded.append(g)
+            except Exception as e:
+                lc_logger.warning("grading_failed", error=str(e))
+        graded.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return graded
+
+    def _select_evidence(self, graded: List[Dict[str, Any]]) -> List[Document]:
+        top_m = SETTINGS.SELF_RAG.TOP_M
+        rel_th = SETTINGS.SELF_RAG.RELEVANCE_THRESHOLD
+        sup_th = SETTINGS.SELF_RAG.SUPPORT_THRESHOLD
+        selected: List[Document] = []
+        for g in graded:
+            if g["relevance"] >= rel_th and g["supportiveness"] >= sup_th:
+                selected.append(g["doc"])
+            if len(selected) >= top_m:
+                break
+        # Ensure at least 2 if available
+        if len(selected) < min(2, len(graded)):
+            selected = [
+                x["doc"] for x in graded[: min(SETTINGS.SELF_RAG.TOP_M, len(graded))]
+            ]
+        return selected
+
+    async def _generate_query_variants(self, question: str, n: int) -> List[str]:
+        prompt = (
+            "Generate distinct alternative search queries (no numbering).\n"
+            f"Return JSON list of {n} strings covering different phrasings/aspects of: {question}\n"
+        )
+        out = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.llm.predict(prompt)
+        )
+        js = self._safe_json(out)
+        if isinstance(js, list) and js:
+            return [str(x)[:200] for x in js][:n]
+        return [question]
+
+    async def _hyde_query(self, question: str) -> str:
+        prompt = (
+            "Write a short (3-5 sentences) hypothetical but plausible answer to the question.\n"
+            "Do not fabricate specifics; keep generic structure.\n"
+            f"Question: {question}\n"
+            'Then output a JSON object: {"keywords": ['
+            """comma-separated keywords"""
+            "]}."
+        )
+        out = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.llm.predict(prompt)
+        )
+        js = self._safe_json(out) or {}
+        kws = js.get("keywords") or []
+        if isinstance(kws, list) and kws:
+            return ", ".join([str(k) for k in kws][:12])
+        return question
+
+    async def _rrf_merge(
+        self,
+        queries: List[str],
+        k: int,
+        doc_id: Optional[str],
+        collection_name: Optional[str],
+    ) -> List[Document]:
+        # Retrieve per query and merge using Reciprocal Rank Fusion
+        rrf_scores: Dict[str, float] = defaultdict(float)
+        doc_map: Dict[str, Document] = {}
+        for q in queries:
+            retriever = await self._get_hybrid_retriever(
+                q, doc_id=doc_id, k=k, collection_name=collection_name
+            )
+            try:
+                docs = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: retriever.get_relevant_documents(q)
+                )
+            except Exception:
+                docs = []
+            for rank, d in enumerate(docs):
+                key = self._doc_key(d)
+                rrf_scores[key] += 1.0 / (60.0 + rank)
+                if key not in doc_map:
+                    doc_map[key] = d
+        ranked = sorted(
+            doc_map.items(), key=lambda x: rrf_scores.get(x[0], 0), reverse=True
+        )
+        return [doc for key, doc in ranked[:k]]
+
+    async def _jina_rerank(
+        self, question: str, docs: List[Document], top_n: int
+    ) -> List[Document]:
+        """Call Jina Reranker API to reorder documents by cross-encoder relevance.
+
+        Falls back to original order on error or when not configured.
+        """
+        try:
+            api_key = (
+                SETTINGS.JINA.JINA_API_KEY.get_secret_value()
+                if hasattr(SETTINGS.JINA, "JINA_API_KEY")
+                else ""
+            )
+        except Exception:
+            api_key = ""
+        if not SETTINGS.JINA.RERANKER_ENABLED or not api_key or not docs:
+            return docs
+        try:
+            payload = {
+                "model": SETTINGS.JINA.RERANKER_MODEL,
+                "query": question,
+                "top_n": max(1, min(int(top_n), len(docs))),
+                "documents": [(d.page_content or "")[:4000] for d in docs],
+                "return_documents": False,
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.jina.ai/v1/rerank", headers=headers, json=payload
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            results = data.get("results") or data.get("data") or []
+            ranking: List[tuple[int, float]] = []
+            for item in results:
+                try:
+                    idx = int(item.get("index"))
+                    score = float(
+                        item.get("relevance_score") or item.get("score") or 0.0
+                    )
+                    if 0 <= idx < len(docs):
+                        ranking.append((idx, score))
+                except Exception:
+                    continue
+            if not ranking:
+                return docs
+            ranking.sort(key=lambda x: x[1], reverse=True)
+            ordered = [docs[i] for i, _ in ranking]
+            return ordered + [d for d in docs if d not in ordered]
+        except Exception as e:
+            lc_logger.warning("jina_rerank_failed", error=str(e))
+            return docs
+
+    async def _generate_answer_with_citations(
+        self, question: str, evidence: List[Document]
+    ) -> str:
+        lines = []
+        for d in evidence:
+            md = d.metadata or {}
+            did = md.get("doc_id", "unknown")
+            cid = md.get("chunk_id") or md.get("id") or md.get("sequence") or "0"
+            lines.append(f"- ({did}:{cid}) {d.page_content[:800]}")
+        prompt = (
+            "Use ONLY the evidence to answer. Every factual sentence MUST include citations like [doc_id:chunk_id].\n"
+            "If evidence is insufficient, say so.\n\n"
+            "Evidence:\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + f"Question: {question}\n\nFinal answer with citations:"
+        )
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.llm.predict(prompt)
+        )
+
+    async def _chain_of_verification(
+        self, question: str, answer: str, evidence: List[Document]
+    ) -> Dict[str, Any]:
+        lines = []
+        for d in evidence:
+            md = d.metadata or {}
+            did = md.get("doc_id", "unknown")
+            cid = md.get("chunk_id") or md.get("id") or md.get("sequence") or "0"
+            lines.append(f"- ({did}:{cid}) {d.page_content[:600]}")
+        prompt = (
+            "Extract up to 6 atomic factual claims from the answer; verify each against the evidence.\n"
+            "Label each as Verified/Unsupported/Contradicted and list supporting citations.\n"
+            'Return JSON: {"claims":[{"text":...,"label":...,"evidence":["doc:chunk"]}],"needs_revision":bool,"notes":"..."}.\n\n'
+            f"Question: {question}\nAnswer: {answer}\n\nEvidence:\n" + "\n".join(lines)
+        )
+        raw = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self.llm.predict(prompt)
+        )
+        parsed = self._safe_json(raw) or {
+            "claims": [],
+            "needs_revision": False,
+            "notes": "",
+        }
+        return {"raw": raw, "parsed": parsed}
+
+    async def self_rag_answer(
+        self,
+        question: str,
+        doc_id: Optional[str] = None,
+        k: int = 5,
+        collection_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        diagnostics: Dict[str, Any] = {"self_rag": True}
+        # Step 0: classify retrieval need
+        try:
+            cls = await self._classify_retrieval_needed(question)
+        except Exception:
+            cls = {"retrieval_needed": True}
+        diagnostics["retrieval_needed"] = cls
+        if not cls.get("retrieval_needed", True):
+            # Direct short answer, low confidence cap
+            direct = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.llm.predict(f"Answer concisely: {question}")
+            )
+            return {
+                "answer": direct,
+                "question": question,
+                "source_documents": [],
+                "processing_info": {
+                    "retriever_type": "none",
+                    "prompt_type": "direct",
+                    "doc_filter": doc_id,
+                },
+                "retrieval_diagnostics": diagnostics,
+                "model_used": "gpt-4-turbo-preview",
+            }
+
+        # Step 1: initial hybrid retrieval (retrieve more if reranker enabled)
+        retrieve_k = max(k, SETTINGS.SELF_RAG.TOP_K)
+        if getattr(SETTINGS, "JINA", None) and SETTINGS.JINA.RERANKER_ENABLED:
+            retrieve_k = max(retrieve_k, 20)
+        retriever = await self._get_hybrid_retriever(
+            question, doc_id=doc_id, k=retrieve_k, collection_name=collection_name
+        )
+        try:
+            initial_docs = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: retriever.get_relevant_documents(question)
+            )
+        except Exception:
+            initial_docs = []
+        diagnostics["initial_docs_count"] = len(initial_docs)
+        # Optional: Jina rerank before grading
+        used_jina = False
+        if getattr(SETTINGS, "JINA", None) and SETTINGS.JINA.RERANKER_ENABLED:
+            try:
+                initial_docs = await self._jina_rerank(
+                    question,
+                    initial_docs,
+                    top_n=min(SETTINGS.SELF_RAG.TOP_K * 2, len(initial_docs)),
+                )
+                used_jina = True
+            except Exception:
+                used_jina = False
+        diagnostics["jina_reranker_used"] = used_jina
+        if used_jina:
+            diagnostics["jina_model"] = SETTINGS.JINA.RERANKER_MODEL
+
+        # Step 2: grade and select evidence
+        graded = await self._grade_documents(
+            question, initial_docs[: SETTINGS.SELF_RAG.TOP_K]
+        )
+        selected = self._select_evidence(graded)
+        diagnostics["grades"] = [
+            {
+                "relevance": g["relevance"],
+                "supportiveness": g["supportiveness"],
+                "usefulness": g["usefulness"],
+                "key": self._doc_key(g["doc"]),
+            }
+            for g in graded
+        ]
+        diagnostics["selected_count"] = len(selected)
+
+        # Step 3: if weak coverage -> generate query variants and HyDE rewrite, then RRF merge
+        need_rewrite = len(selected) < 2
+        if need_rewrite and SETTINGS.SELF_RAG.MAX_REWRITE > 0:
+            qvars = await self._generate_query_variants(
+                question, SETTINGS.SELF_RAG.RAG_FUSION_QUERIES
+            )
+            hyde_q = await self._hyde_query(question)
+            all_q = list(dict.fromkeys([question] + qvars + [hyde_q]))
+            diagnostics["query_variants"] = all_q
+            merged = await self._rrf_merge(
+                all_q,
+                k=max(k, SETTINGS.SELF_RAG.TOP_K),
+                doc_id=doc_id,
+                collection_name=collection_name,
+            )
+            if getattr(SETTINGS, "JINA", None) and SETTINGS.JINA.RERANKER_ENABLED:
+                try:
+                    merged = await self._jina_rerank(
+                        question,
+                        merged,
+                        top_n=min(SETTINGS.SELF_RAG.TOP_K * 2, len(merged)),
+                    )
+                except Exception:
+                    pass
+            graded2 = await self._grade_documents(question, merged)
+            selected = self._select_evidence(graded2)
+            diagnostics["selected_count_after_rewrite"] = len(selected)
+
+        # Step 4: answer with citations
+        answer = await self._generate_answer_with_citations(question, selected)
+
+        # Step 5: chain-of-verification and possible revision
+        cov = await self._chain_of_verification(question, answer, selected)
+        verification = cov.get("parsed", {})
+        if verification.get("needs_revision"):
+            # one revision loop
+            rev_prompt = (
+                "Revise the answer to ensure every claim is supported by the evidence.\n"
+                "Keep citations [doc:chunk] and remove unsupported claims.\n"
+                f"Question: {question}\nOriginal Answer: {answer}\nVerification: {json.dumps(verification)[:1500]}\n"
+            )
+            answer = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.llm.predict(rev_prompt)
+            )
+
+        response = {
+            "answer": answer,
+            "question": question,
+            "search_type": "hybrid",
+            "source_count": len(selected),
+            "source_documents": selected,
+            "processing_info": {
+                "retriever_type": "SelfRAG-Hybrid+Jina"
+                if used_jina
+                else "SelfRAG-Hybrid",
+                "chunks_retrieved": len(selected),
+                "prompt_type": "self_rag",
+                "doc_filter": doc_id,
+            },
+            "verification_report": verification,
+            "retrieval_diagnostics": diagnostics,
+            "model_used": "gpt-4-turbo-preview",
+        }
+        return response
 
     def _get_vector_store(self, collection_name: Optional[str] = None) -> PGVector:
         if not collection_name:
@@ -410,13 +813,22 @@ async def query_documents(
     detailed: bool = False,
     k: int = 5,
 ) -> Dict[str, Any]:
-    result = await _query_service_impl.answer_question(
-        question=question,
-        doc_id=doc_id,
-        search_type=SearchType(search_type),
-        detailed=detailed,
-        k=k,
-    )
+    # When detailed=True and Self-RAG is enabled, use the Self-RAG Lite flow.
+    if SETTINGS.SELF_RAG.SELF_RAG_ENABLED and detailed:
+        result = await _query_service_impl.self_rag_answer(
+            question=question,
+            doc_id=doc_id,
+            k=k,
+            collection_name=None,
+        )
+    else:
+        result = await _query_service_impl.answer_question(
+            question=question,
+            doc_id=doc_id,
+            search_type=SearchType(search_type),
+            detailed=detailed,
+            k=k,
+        )
     if isinstance(result, dict) and "answer" in result:
         confidence_score = calculate_confidence_score(
             answer=result.get("answer", ""),

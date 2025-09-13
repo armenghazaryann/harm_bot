@@ -76,6 +76,14 @@ docker-migrate:
 	fi
 	${DOCKER_EXEC_LOCAL} alembic upgrade head
 
+docker-downgrade:
+	@echo "Starting database downgrade..."
+	@if ! docker ps | grep -q rag_api; then \
+		echo "Error: 'rag_api' container is not running. Please start the containers first with 'make run'"; \
+		exit 1; \
+	fi
+	${DOCKER_EXEC_LOCAL} alembic downgrade -1
+
 docker-revision:
 	docker compose --env-file .env run --rm api alembic revision --autogenerate -m "$(m)"
 

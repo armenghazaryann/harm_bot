@@ -49,22 +49,22 @@ services:
       mc mb -p local/${MINIO_BUCKET:-rag} || true
       "
 
-  neo4j:
-    image: neo4j:5
-    container_name: rag_neo4j
-    environment:
-      NEO4J_AUTH: neo4j/neo4jPass12345
-    ports:
-      - "7474:7474" # HTTP
-      - "7687:7687" # Bolt
-    volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-    healthcheck:
-      test: ["CMD-SHELL", "cypher-shell -a bolt://localhost:7687 -u neo4j -p neo4jPass12345 'RETURN 1' || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
+#  neo4j:
+#    image: neo4j:5
+#    container_name: rag_neo4j
+#    environment:
+#      NEO4J_AUTH: neo4j/neo4jPass12345
+#    ports:
+#      - "7474:7474" # HTTP
+#      - "7687:7687" # Bolt
+#    volumes:
+#      - neo4j_data:/data
+#      - neo4j_logs:/logs
+#    healthcheck:
+#      test: ["CMD-SHELL", "cypher-shell -a bolt://localhost:7687 -u neo4j -p neo4jPass12345 'RETURN 1' || exit 1"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 12
 
   api:
     build:
@@ -79,8 +79,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-      neo4j:
-        condition: service_healthy
+#      neo4j:
+#        condition: service_healthy
       minio:
         condition: service_started
     volumes:
@@ -98,8 +98,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-      neo4j:
-        condition: service_healthy
+#      neo4j:
+#        condition: service_healthy
       minio:
         condition: service_started
     volumes:
@@ -141,5 +141,5 @@ services:
 volumes:
   pg_data:
   minio_data:
-  neo4j_data:
-  neo4j_logs:
+#  neo4j_data:
+#  neo4j_logs:

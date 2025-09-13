@@ -15,7 +15,7 @@ class DocumentType(str, Enum):
     TRANSCRIPT = "transcript"
     EARNINGS_RELEASE = "earnings_release"
     SLIDE_DECK = "slide_deck"
-    PRESS_ANNOUNCEMENT = "press_announcement"
+    GENERAL = "general"
 
 
 class DocumentStatus(str, Enum):

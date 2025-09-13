@@ -10,17 +10,13 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentValidator:
-    """Validates uploaded documents for processing."""
+    # refactored
 
     # Supported MIME types
     SUPPORTED_MIME_TYPES = {
         "application/pdf",
-        "text/csv",
         "text/plain",
         "text/markdown",
-        "application/json",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "application/msword",
     }
 
     # Maximum file size (100MB for MVP)
@@ -28,18 +24,7 @@ class DocumentValidator:
 
     @classmethod
     async def validate_upload(cls, file: UploadFile) -> bytes:
-        """
-        Validate an uploaded file and return its content.
-
-        Args:
-            file: The uploaded file
-
-        Returns:
-            The file content as bytes
-
-        Raises:
-            HTTPException: If validation fails
-        """
+        # refactored
         if not file.filename:
             raise HTTPException(status_code=400, detail="No filename provided")
 
@@ -59,13 +44,12 @@ class DocumentValidator:
 
     @classmethod
     def _validate_file_type(cls, file: UploadFile) -> None:
-        """Validate file type based on extension and MIME type."""
+        # refactored
         filename = file.filename.lower() if file.filename else ""
 
         # Check file extension
         if not any(
-            filename.endswith(ext)
-            for ext in [".pdf", ".csv", ".txt", ".md", ".json", ".docx", ".doc"]
+            filename.endswith(ext) for ext in [".pdf", ".txt", ".md", ".docx", ".doc"]
         ):
             raise HTTPException(
                 status_code=400, detail=f"Unsupported file type: {filename}"
@@ -75,17 +59,21 @@ class DocumentValidator:
         if file.content_type and file.content_type not in cls.SUPPORTED_MIME_TYPES:
             # Allow some common variations
             if file.content_type.startswith("text/") and any(
-                filename.endswith(ext) for ext in [".txt", ".csv", ".md"]
+                filename.endswith(ext) for ext in [".txt", ".md", ".docx", ".doc"]
             ):
                 pass  # Allow text files with various subtypes
             else:
                 logger.warning(
                     f"Potentially unsupported MIME type: {file.content_type} for file: {filename}"
                 )
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported MIME type: {file.content_type} for file: {filename}",
+                )
 
     @classmethod
     def _validate_file_size(cls, content: bytes) -> None:
-        """Validate file size."""
+        # refactored
         if len(content) > cls.MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=413,
@@ -100,19 +88,41 @@ class DocumentValidator:
         cls, filename: str, content_type: Optional[str]
     ) -> DocumentType:
         """
-        Determine document type based on filename containing 'transcript'.
+        Determine document type based on filename and simple heuristics.
 
         Args:
             filename: The filename
             content_type: The MIME content type (ignored for MVP)
 
         Returns:
-            'transcript' if filename contains 'transcript', otherwise 'unknown'
+            A best-effort classification into DocumentType. Defaults to TRANSCRIPT
+            to preserve MVP behavior if unknown.
         """
-        filename_lower = filename.lower()
+        # Normalize separators for robust matching
+        filename_lower = (filename or "").lower()
+        normalized = (
+            filename_lower.replace("-", "_").replace(" ", "_").replace("__", "_")
+        )
 
-        # For MVP: only support TRANSCRIPT type
-        if "transcript" in filename_lower:
+        # Transcript
+        if "transcript" in normalized:
             return DocumentType.TRANSCRIPT
 
-        return DocumentType.TRANSCRIPT
+        # Earnings Release (handle earnings_release, earnings-release, earnings release)
+        if "earnings_release" in normalized or (
+            "earnings" in normalized and "release" in normalized
+        ):
+            return DocumentType.EARNINGS_RELEASE
+
+        # Slide Decks
+        if any(
+            token in normalized for token in ["slide", "slides", "deck", "slide_deck"]
+        ):
+            return DocumentType.SLIDE_DECK
+
+        # Press Announcements
+        # if any(token in normalized for token in ["press", "announcement", "news_release", "press_release"]):
+        #     return DocumentType.GENERAL
+
+        # Default to transcript for MVP compatibility
+        return DocumentType.GENERAL

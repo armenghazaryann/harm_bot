@@ -92,6 +92,20 @@ class Neo4jSettings(CustomSettings):
     NEO4J_PASSWORD: SecretStr = Field(default="neo4j")
 
 
+class JinaSettings(CustomSettings):
+    """Configuration for Jina AI APIs (Reranker, Embeddings, etc.).
+
+    Env vars:
+    - JINA_API_KEY
+    - JINA_RERANKER_ENABLED
+    - JINA_RERANKER_MODEL
+    """
+
+    JINA_API_KEY: SecretStr = Field(default="")
+    RERANKER_ENABLED: bool = Field(default=True)
+    RERANKER_MODEL: str = Field(default="jina-reranker-v2-base-multilingual")
+
+
 class ProcessingSettings(CustomSettings):
     PAGE_DPI: int = Field(default=300)
     EMBED_BATCH_SIZE: int = Field(default=128)
@@ -128,16 +142,42 @@ class UiSettings(CustomSettings):
     ENDPOINT_DOCUMENT_UPLOAD: str = Field(default="/api/v1/documents/upload")
 
 
+class SelfRagSettings(CustomSettings):
+    """Configuration for Self-RAG Lite query flow.
+
+    Set via env vars (optional):
+    - SELF_RAG_ENABLED
+    - SELF_RAG_TOP_K
+    - SELF_RAG_TOP_M
+    - SELF_RAG_RELEVANCE_THRESHOLD
+    - SELF_RAG_SUPPORT_THRESHOLD
+    - SELF_RAG_MAX_REWRITE
+    - SELF_RAG_MAX_CLAIMS
+    - SELF_RAG_RAG_FUSION_QUERIES
+    """
+
+    SELF_RAG_ENABLED: bool = Field(default=True)
+    TOP_K: int = Field(default=8)
+    TOP_M: int = Field(default=5)
+    RELEVANCE_THRESHOLD: float = Field(default=0.6)
+    SUPPORT_THRESHOLD: float = Field(default=0.5)
+    MAX_REWRITE: int = Field(default=1)
+    MAX_CLAIMS: int = Field(default=6)
+    RAG_FUSION_QUERIES: int = Field(default=3)
+
+
 class Settings(BaseModel):
     APP: AppSettings = Field(default_factory=AppSettings)
     DATABASE: PgDbSettings = Field(default_factory=PgDbSettings)
     REDIS: RedisSettings = Field(default_factory=RedisSettings)
     MINIO: MinIOSettings = Field(default_factory=MinIOSettings)
     OPENAI: OpenAISettings = Field(default_factory=OpenAISettings)
+    JINA: JinaSettings = Field(default_factory=JinaSettings)
     PROCESSING: ProcessingSettings = Field(default_factory=ProcessingSettings)
     NEO4J: Neo4jSettings = Field(default_factory=Neo4jSettings)
     VECTOR: VectorSettings = Field(default_factory=VectorSettings)
     UI: UiSettings = Field(default_factory=UiSettings)
+    SELF_RAG: SelfRagSettings = Field(default_factory=SelfRagSettings)
 
 
 @lru_cache
