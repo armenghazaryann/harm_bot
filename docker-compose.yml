@@ -121,6 +121,23 @@ services:
       - .:/app
     command: celery -A workers.celery_app.app flower --port=5555
 
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_streamlit
+    env_file: .env.docker
+    environment:
+      - PYTHONPATH=/app
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_started
+    volumes:
+      - .:/app
+    command: streamlit run streamlit_ui/chat_ui.py --server.address 0.0.0.0 --server.port 8501
+
 volumes:
   pg_data:
   minio_data:

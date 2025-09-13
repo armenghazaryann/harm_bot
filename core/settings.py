@@ -114,6 +114,20 @@ class VectorSettings(CustomSettings):
     VECTOR_USE_JSONB: bool = Field(default=True)
 
 
+class UiSettings(CustomSettings):
+    """Configuration for Streamlit UI to reach API endpoints.
+
+    Set via env vars:
+    - API_BASE_URL
+    - ENDPOINT_QUERY_ANSWER
+    - ENDPOINT_DOCUMENT_UPLOAD
+    """
+
+    API_BASE_URL: str = Field(default="http://localhost:8000")
+    ENDPOINT_QUERY_ANSWER: str = Field(default="/api/v1/query/answer")
+    ENDPOINT_DOCUMENT_UPLOAD: str = Field(default="/api/v1/documents/upload")
+
+
 class Settings(BaseModel):
     APP: AppSettings = Field(default_factory=AppSettings)
     DATABASE: PgDbSettings = Field(default_factory=PgDbSettings)
@@ -123,6 +137,7 @@ class Settings(BaseModel):
     PROCESSING: ProcessingSettings = Field(default_factory=ProcessingSettings)
     NEO4J: Neo4jSettings = Field(default_factory=Neo4jSettings)
     VECTOR: VectorSettings = Field(default_factory=VectorSettings)
+    UI: UiSettings = Field(default_factory=UiSettings)
 
 
 @lru_cache
