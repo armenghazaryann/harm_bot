@@ -91,7 +91,7 @@ class WorkerContainer(containers.DeclarativeContainer):
 
     # LangChain Query Service - production-grade hybrid search
     langchain_query_service = providers.Callable(
-        "workers.langchain_query_service.query_documents"
+        "api.features.query.service.query_documents"
     )
 
     # Note: Indexing is now handled automatically by LangChain PGVector

@@ -21,8 +21,11 @@ from api.features.query.exceptions import (
     AnswerGenerationError,
     NoResultsError,
 )
-from api.features.query.service import QueryService
-from workers.langchain_query_service import query_documents, semantic_search_documents
+from api.features.query.service import (
+    QueryService,
+    query_documents,
+    semantic_search_documents,
+)
 from api.shared.response import ResponseModel
 
 logger = logging.getLogger("rag.query")
@@ -274,6 +277,10 @@ class QueryController:
                 k=request.context_limit,
                 search_type="hybrid",
             )
+
+            # Propagate backend errors properly
+            if result.get("error"):
+                raise HTTPException(status_code=500, detail=str(result.get("error")))
 
             if not result.get("answer"):
                 raise NoResultsError(request.question)
