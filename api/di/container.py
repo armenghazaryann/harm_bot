@@ -70,8 +70,6 @@ class ServiceContainer(containers.DeclarativeContainer):
 
     query_service = providers.Factory(
         "api.features.query.service.QueryService",
-        embedding_client=None,
-        llm_client=None,
     )
 
 
