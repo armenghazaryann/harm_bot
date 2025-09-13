@@ -76,31 +76,28 @@ class ServiceContainer(containers.DeclarativeContainer):
 
 
 class WorkerContainer(containers.DeclarativeContainer):
-    """Worker-specific dependencies."""
+    """Worker-specific dependencies - MIGRATED TO LANGCHAIN.
+
+    All deprecated worker functions have been replaced by LangChain components:
+    - workers.transcripts.* → workers.langchain_processor.process_document_langchain_task
+    - workers.embeddings.* → LangChain OpenAIEmbeddings + PGVector automatic handling
+    - workers.indexing.* → LangChain PGVector automatic indexing
+    """
 
     infrastructure = providers.DependenciesContainer()
 
-    # Worker tasks
-    transcript_create_jsonl = providers.Callable(
-        "workers.transcripts.create_utterances_jsonl"
-    )
-    transcript_ingest_pg = providers.Callable(
-        "workers.transcripts.ingest_transcript_pg_from_minio"
-    )
-    transcript_ingest_neo4j = providers.Callable(
-        "workers.transcripts.ingest_transcript_neo4j_from_minio"
-    )
-    transcript_materialize_chunks = providers.Callable(
-        "workers.transcripts.materialize_transcript_chunks_from_pg"
+    # LangChain Document Processor - replaces all deprecated workers
+    langchain_processor = providers.Callable(
+        "workers.langchain_processor.process_document_with_langchain"
     )
 
-    # Workers: Embeddings
-    embed_document_chunks = providers.Callable(
-        "workers.embeddings.embed_document_chunks"
+    # LangChain Query Service - production-grade hybrid search
+    langchain_query_service = providers.Callable(
+        "workers.langchain_query_service.query_documents"
     )
 
-    # Workers: Indexing with LangChain VectorStore (PGVector)
-    indexing_pgvector = providers.Callable("workers.indexing.index_chunks_pgvector")
+    # Note: Indexing is now handled automatically by LangChain PGVector
+    # No manual indexing workers needed - LangChain handles HNSW indexing automatically
 
 
 class ControllerContainer(containers.DeclarativeContainer):

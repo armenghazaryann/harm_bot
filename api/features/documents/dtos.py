@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import Field, validator
 
 from api.shared.dtos import BaseDTO, TimestampMixin
+from api.features.documents.models import DocumentModel
 
 
 class DocumentUploadRequest(BaseDTO):
@@ -17,7 +18,7 @@ class DocumentUploadRequest(BaseDTO):
     )
 
     @validator("filename")
-    def validate_filename(cls, v):
+    def validate_filename(cls, v) -> str:
         if not v or not v.strip():
             raise ValueError("Filename cannot be empty")
         return v.strip()
@@ -64,6 +65,25 @@ class DocumentStatusResponse(BaseDTO, TimestampMixin):
         default=None, description="Document metadata"
     )
 
+    @classmethod
+    def from_entity(cls, entity: DocumentModel) -> "DocumentStatusResponse":
+        """Create DocumentStatusResponse from DocumentModel."""
+        return cls(
+            doc_id=entity.id,
+            filename=entity.filename,
+            status=entity.status.value
+            if hasattr(entity.status, "value")
+            else str(entity.status),
+            document_type=entity.document_type.value
+            if hasattr(entity.document_type, "value")
+            else str(entity.document_type),
+            size=entity.size,
+            checksum=entity.checksum,
+            progress=entity.get_processing_progress(),
+            error_message=entity.error_message,
+            metadata=entity.metadata,
+        )
+
 
 class DocumentListResponse(BaseDTO):
     """Response DTO for document listing."""
@@ -84,7 +104,7 @@ class DocumentProcessingRequest(BaseDTO):
     priority: str = Field(default="normal", description="Processing priority")
 
     @validator("priority")
-    def validate_priority(cls, v):
+    def validate_priority(cls, v) -> str:
         allowed_priorities = ["low", "normal", "high", "urgent"]
         if v not in allowed_priorities:
             raise ValueError(f"Priority must be one of: {allowed_priorities}")

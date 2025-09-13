@@ -1,0 +1,38 @@
+"""
+DEPRECATED: Custom chunk entity - REPLACED BY LANGCHAIN PGVECTOR
+
+This file is disabled in favor of LangChain's PGVector implementation
+which automatically manages document chunks and metadata storage.
+
+LangChain PGVector automatically handles:
+- Document chunking via RecursiveCharacterTextSplitter
+- Metadata storage in JSONB fields
+- Vector embeddings with document relationships
+- Efficient querying and retrieval
+
+MIGRATION COMPLETE: All functionality moved to LangChain PGVector.
+"""
+
+# DISABLED - Using LangChain PGVector and RecursiveCharacterTextSplitter instead
+# from enum import Enum
+# from typing import Optional
+# from sqlalchemy import String, Integer, Text, JSON, ForeignKey, Index
+# from sqlalchemy.orm import Mapped, mapped_column, relationship
+# from api.shared.entities.base import BaseEntity
+
+# class ChunkType(str, Enum):
+"""Chunk type enumeration for different content types."""
+#     TEXT = "text"
+#     TABLE = "table"
+#     PAGE = "page"
+#     SLIDE = "slide"
+#     SECTION = "section"
+
+# class Chunk(BaseEntity):
+#     """DEPRECATED: Chunk entity replaced by LangChain PGVector."""
+#     pass
+
+# All chunk functionality is now handled by:
+# - LangChain RecursiveCharacterTextSplitter for optimal chunking
+# - LangChain PGVector for storage with automatic metadata handling
+# - LangChain Document objects for chunk representation

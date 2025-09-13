@@ -102,6 +102,18 @@ class ProcessingSettings(CustomSettings):
     CHUNK_OVERLAP_TOKENS: int = Field(default=80)
 
 
+class VectorSettings(CustomSettings):
+    """Configuration for PGVector-backed vector store.
+
+    Set via env vars:
+    - VECTOR_COLLECTION_NAME
+    - VECTOR_USE_JSONB
+    """
+
+    COLLECTION_NAME: str = Field(default="langchain_pgvector")
+    VECTOR_USE_JSONB: bool = Field(default=True)
+
+
 class Settings(BaseModel):
     APP: AppSettings = Field(default_factory=AppSettings)
     DATABASE: PgDbSettings = Field(default_factory=PgDbSettings)
@@ -110,6 +122,7 @@ class Settings(BaseModel):
     OPENAI: OpenAISettings = Field(default_factory=OpenAISettings)
     PROCESSING: ProcessingSettings = Field(default_factory=ProcessingSettings)
     NEO4J: Neo4jSettings = Field(default_factory=Neo4jSettings)
+    VECTOR: VectorSettings = Field(default_factory=VectorSettings)
 
 
 @lru_cache

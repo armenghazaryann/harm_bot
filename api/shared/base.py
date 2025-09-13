@@ -52,7 +52,7 @@ class BaseRepository(ABC, Generic[T]):
 
     async def get_by_id(self, entity_id: UUID) -> Optional[T]:
         """Get entity by ID."""
-        stmt = select(self.model).where(self.model.id == entity_id)
+        stmt = select(self.model).where(self.model.id == entity_id)  # type: ignore[attr-defined]
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -61,7 +61,7 @@ class BaseRepository(ABC, Generic[T]):
     ) -> List[T]:
         """Get entities by field value."""
         field = getattr(self.model, field_name)
-        stmt = select(self.model).where(field == value)
+        stmt = select(self.model).where(field == value)  # type: ignore[attr-defined]
 
         if limit:
             stmt = stmt.limit(limit)
@@ -76,7 +76,7 @@ class BaseRepository(ABC, Generic[T]):
         for field_name, value in filters.items():
             if hasattr(self.model, field_name):
                 field = getattr(self.model, field_name)
-                stmt = stmt.where(field == value)
+                stmt = stmt.where(field == value)  # type: ignore[attr-defined]
 
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
@@ -91,7 +91,7 @@ class BaseRepository(ABC, Generic[T]):
         """Update entity by ID with field values."""
         stmt = (
             update(self.model)
-            .where(self.model.id == entity_id)
+            .where(self.model.id == entity_id)  # type: ignore[attr-defined]
             .values(**kwargs)
             .returning(self.model)
         )
@@ -104,7 +104,7 @@ class BaseRepository(ABC, Generic[T]):
 
     async def delete(self, entity_id: UUID) -> bool:
         """Delete entity by ID."""
-        stmt = delete(self.model).where(self.model.id == entity_id)
+        stmt = delete(self.model).where(self.model.id == entity_id)  # type: ignore[attr-defined]
         result = await self.session.execute(stmt)
         await self.session.flush()
         return result.rowcount > 0
@@ -126,7 +126,7 @@ class BaseRepository(ABC, Generic[T]):
     ) -> Tuple[List[T], int]:
         """List entities with pagination and filters."""
         # Build count query
-        count_stmt = select(func.count(self.model.id))
+        count_stmt = select(func.count(self.model.id))  # type: ignore[attr-defined]
 
         # Build select query
         stmt = select(self.model)
@@ -162,7 +162,9 @@ class BaseRepository(ABC, Generic[T]):
         result = await self.session.execute(stmt)
         count_result = await self.session.execute(count_stmt)
 
-        return list(result.scalars().all()), count_result.scalar()
+        # count_result.scalar() may be None, default to 0
+        total = count_result.scalar() or 0
+        return list(result.scalars().all()), int(total)
 
     async def exists(self, entity_id: UUID) -> bool:
         """Check if entity exists."""
@@ -172,7 +174,7 @@ class BaseRepository(ABC, Generic[T]):
 
     async def count(self, **filters: Any) -> int:
         """Count entities with filters."""
-        stmt = select(func.count(self.model.id))
+        stmt = select(func.count(self.model.id))  # type: ignore[attr-defined]
 
         for field_name, value in filters.items():
             if hasattr(self.model, field_name) and value is not None:
@@ -183,7 +185,7 @@ class BaseRepository(ABC, Generic[T]):
                     stmt = stmt.where(field == value)
 
         result = await self.session.execute(stmt)
-        return result.scalar()
+        return int(result.scalar() or 0)
 
 
 class BaseService(ABC, Generic[T]):

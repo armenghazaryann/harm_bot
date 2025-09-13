@@ -117,7 +117,7 @@ async def delete_document(
             delete_chunks=delete_chunks,
             delete_embeddings=delete_embeddings,
         )
-        result = await controller.delete_document(doc_id, delete_request, db_session)
+        result = await controller.delete_document(delete_request, db_session=db_session)
         return ResponseModel.success(
             data=result, message="Document deleted successfully"
         )

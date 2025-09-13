@@ -2,6 +2,7 @@
 import hashlib
 import mimetypes
 from pathlib import Path
+from typing import Dict, Any
 from uuid import UUID
 
 
@@ -62,14 +63,15 @@ def is_valid_uuid(uuid_string: str) -> bool:
 
 def format_bytes(size: int) -> str:
     """Format bytes to human readable format."""
+    size_float = float(size)
     for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
+        if size_float < 1024.0:
+            return f"{size_float:.1f} {unit}"
+        size_float /= 1024.0
+    return f"{size_float:.1f} PB"
 
 
-def extract_file_metadata(filename: str, content: bytes) -> dict:
+def extract_file_metadata(filename: str, content: bytes) -> Dict[str, Any]:
     """Extract metadata from file."""
     return {
         "filename": filename,

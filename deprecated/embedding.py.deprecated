@@ -1,0 +1,21 @@
+"""
+DEPRECATED: Custom embedding entity - REPLACED BY LANGCHAIN PGVECTOR
+
+This file is disabled in favor of LangChain's PGVector implementation
+to reduce boilerplate and eliminate duplicate embeddings architectures.
+
+LangChain PGVector automatically manages:
+- Vector table creation and schema
+- HNSW index creation and optimization
+- Embedding storage and retrieval
+- Distance/similarity calculations
+
+To re-enable custom embeddings:
+1. Uncomment the class definition below
+2. Add back embeddings relationship in chunk.py
+3. Update indexing.py to create custom embeddings table indexes
+4. Handle migration between LangChain and custom tables
+"""
+
+# ALL CODE REMOVED - Completely replaced by LangChain PGVector
+# No custom embedding entity needed - LangChain handles everything automatically

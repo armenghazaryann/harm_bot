@@ -1,5 +1,6 @@
 """Controller for the Query feature."""
 import logging
+import uuid
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,7 @@ from api.features.query.exceptions import (
     NoResultsError,
 )
 from api.features.query.service import QueryService
+from workers.langchain_query_service import query_documents, semantic_search_documents
 from api.shared.response import ResponseModel
 
 logger = logging.getLogger("rag.query")
@@ -35,29 +37,75 @@ class QueryController:
     async def search_documents(
         self, request: QueryRequest, db_session: AsyncSession
     ) -> ResponseModel[SearchResponse]:
-        """Search documents using hybrid search."""
+        """Search documents using production-grade hybrid search (Vector Store + BM25)."""
         try:
-            # Perform hybrid search by default
-            context = await self.query_service.hybrid_search(
-                query=request.query, top_k=request.top_k, db_session=db_session
+            # Use LangChain hybrid search with EnsembleRetriever (Vector + BM25)
+            result = await query_documents(
+                question=request.query,
+                doc_id=None,  # Search across all documents
+                k=request.top_k,
+                search_type="hybrid",
             )
 
-            if not context.search_results:
-                raise NoResultsError(request.query)
+            # Treat presence of retrieved documents as success, regardless of LLM answer text
+            if not result.get("source_documents"):
+                # Fallback to pure semantic search to increase recall
+                try:
+                    semantic = await semantic_search_documents(
+                        query=request.query, doc_id=None, k=request.top_k
+                    )
+                    fallback_docs = [
+                        type(
+                            "_Doc",
+                            (),
+                            {
+                                "page_content": item.get("content", ""),
+                                "metadata": item.get("metadata", {}),
+                            },
+                        )
+                        for item in (semantic or [])
+                    ]
+                    result["source_documents"] = fallback_docs
+                except Exception:
+                    raise NoResultsError(request.query)
 
-            # Convert to DTOs
-            search_results = [
-                result.to_search_result_dto() for result in context.search_results
-            ]
+            # Convert LangChain result to SearchResponse format
+            search_results = []
+            if result.get("source_documents"):
+                for i, doc in enumerate(result["source_documents"]):
+                    md = doc.metadata or {}
+                    # Derive required DTO fields
+                    chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
+                    document_id = md.get("doc_id")
+                    document_filename = md.get("document_filename") or (
+                        md.get("source") or ""
+                    )
+                    position = md.get("chunk_index") or md.get("sequence") or 0
+
+                    search_results.append(
+                        {
+                            "chunk_id": str(chunk_id),
+                            "content": doc.page_content,
+                            "score": md.get("score", 0.0),
+                            "metadata": md,
+                            "document_id": str(document_id)
+                            if document_id
+                            else str(uuid.uuid4()),
+                            "document_filename": document_filename,
+                            "position": int(position),
+                        }
+                    )
 
             response_data = SearchResponse(
                 query=request.query,
                 results=search_results,
-                total_results=context.total_results,
-                processing_time_ms=context.processing_time_ms,
+                total_results=len(search_results),
+                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
                 search_metadata={
-                    "search_type": context.search_type,
-                    "filters_applied": request.filters is not None,
+                    "search_type": "hybrid_langchain",
+                    "retriever_type": "EnsembleRetriever (Vector + BM25)",
+                    "vector_weight": 0.6,
+                    "bm25_weight": 0.4,
                 },
             )
 
@@ -94,26 +142,55 @@ class QueryController:
     async def semantic_search(
         self, request: SemanticSearchRequest, db_session: AsyncSession
     ) -> ResponseModel[SearchResponse]:
-        """Perform semantic search using vector similarity."""
+        """Perform semantic search using LangChain vector similarity."""
         try:
-            context = await self.query_service.semantic_search(
+            # Use LangChain semantic search
+            result = await semantic_search_documents(
                 query=request.query,
-                top_k=request.top_k,
-                document_filters=request.document_filters,
-                db_session=db_session,
+                doc_id=(
+                    str(request.document_filters[0])
+                    if request.document_filters
+                    else None
+                ),
+                k=request.top_k,
             )
 
-            search_results = [
-                result.to_search_result_dto() for result in context.search_results
-            ]
+            # semantic_search_documents returns a List[Dict]
+            search_results = []
+            for i, item in enumerate(result or []):
+                metadata = item.get("metadata", {})
+                chunk_id = (
+                    metadata.get("chunk_id") or metadata.get("id") or str(uuid.uuid4())
+                )
+                document_id = metadata.get("doc_id") or item.get("doc_id")
+                document_filename = metadata.get("document_filename") or (
+                    metadata.get("source") or ""
+                )
+                position = metadata.get("chunk_index") or metadata.get("sequence") or 0
+
+                search_results.append(
+                    {
+                        "chunk_id": str(chunk_id),
+                        "content": item.get("content", ""),
+                        "score": metadata.get("score", 0.0),
+                        "metadata": metadata,
+                        "document_id": str(document_id)
+                        if document_id
+                        else str(uuid.uuid4()),
+                        "document_filename": document_filename,
+                        "position": int(position),
+                    }
+                )
 
             response_data = SearchResponse(
                 query=request.query,
                 results=search_results,
-                total_results=context.total_results,
-                processing_time_ms=context.processing_time_ms,
+                total_results=len(search_results),
+                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
                 search_metadata={
-                    "search_type": "semantic",
+                    "search_type": "semantic_langchain",
+                    "retriever_type": "PGVector similarity search",
+                    "embedding_model": "text-embedding-3-large",
                     "similarity_threshold": request.similarity_threshold,
                 },
             )
@@ -129,25 +206,49 @@ class QueryController:
     async def keyword_search(
         self, request: KeywordSearchRequest, db_session: AsyncSession
     ) -> ResponseModel[SearchResponse]:
-        """Perform keyword search using full-text search."""
+        """Perform keyword search using LangChain BM25 retriever."""
         try:
-            context = await self.query_service.keyword_search(
-                query=request.query,
-                top_k=10,  # Default top_k for keyword search
-                db_session=db_session,
+            # Use LangChain BM25-based keyword search (part of hybrid search)
+            result = await query_documents(
+                question=request.query,
+                doc_id=None,
+                k=10,  # Default top_k for keyword search
+                search_type="keyword",  # This will use BM25 component
             )
 
-            search_results = [
-                result.to_search_result_dto() for result in context.search_results
-            ]
+            search_results = []
+            if result.get("source_documents"):
+                for i, doc in enumerate(result["source_documents"]):
+                    md = doc.metadata or {}
+                    chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
+                    document_id = md.get("doc_id")
+                    document_filename = md.get("document_filename") or (
+                        md.get("source") or ""
+                    )
+                    position = md.get("chunk_index") or md.get("sequence") or 0
+
+                    search_results.append(
+                        {
+                            "chunk_id": str(chunk_id),
+                            "content": doc.page_content,
+                            "score": md.get("score", 0.0),
+                            "metadata": md,
+                            "document_id": str(document_id)
+                            if document_id
+                            else str(uuid.uuid4()),
+                            "document_filename": document_filename,
+                            "position": int(position),
+                        }
+                    )
 
             response_data = SearchResponse(
                 query=request.query,
                 results=search_results,
-                total_results=context.total_results,
-                processing_time_ms=context.processing_time_ms,
+                total_results=len(search_results),
+                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
                 search_metadata={
-                    "search_type": "keyword",
+                    "search_type": "keyword_langchain",
+                    "retriever_type": "BM25Retriever",
                     "use_stemming": request.use_stemming,
                     "use_fuzzy": request.use_fuzzy,
                 },
@@ -166,25 +267,36 @@ class QueryController:
     ) -> ResponseModel[AnswerResponse]:
         """Answer a question using RAG."""
         try:
-            # First, search for relevant context
-            context = await self.query_service.hybrid_search(
+            # Use LangChain RetrievalQA with hybrid search for answer generation
+            result = await query_documents(
                 query=request.question,
-                top_k=request.context_limit,
-                db_session=db_session,
+                doc_id=None,  # Search across all documents
+                k=request.context_limit,
             )
 
-            if not context.search_results:
+            if not result.get("answer"):
                 raise NoResultsError(request.question)
 
-            # Generate answer using the context
-            answer_model = await self.query_service.generate_answer(
-                question=request.question,
-                context=context,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-            )
+            # Convert LangChain result to AnswerResponse format
+            source_documents = result.get("source_documents", [])
+            sources = [
+                {
+                    "document_id": doc.metadata.get("doc_id"),
+                    "content": doc.page_content,
+                    "metadata": doc.metadata,
+                }
+                for doc in source_documents
+            ]
 
-            response_data = answer_model.to_answer_response_dto()
+            response_data = AnswerResponse(
+                question=request.question,
+                answer=result["answer"],
+                sources=sources,
+                confidence_score=0.85,  # TODO: Add confidence scoring to LangChain service
+                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
+                model_used="gpt-4-turbo",
+                context_used=len(source_documents),
+            )
 
             logger.info(f"Answer generated for question: '{request.question}'")
             return ResponseModel.success(

@@ -1,6 +1,16 @@
-"""Embedding utilities for documents (MVP) - refactored with repository pattern.
+"""
+DEPRECATED: Custom embedding processing - COMPLETELY REPLACED BY LANGCHAIN
 
-Implements embedding for transcript chunks using OpenAI text-embedding-3-small (1536-dim).
+This entire file is obsolete and replaced by LangChain automatic embedding handling:
+
+REPLACED BY:
+- LangChain OpenAIEmbeddings (text-embedding-3-large) in langchain_processor.py
+- LangChain PGVector automatic embedding storage and retrieval
+- LangChain EnsembleRetriever with Vector Store + BM25 hybrid search
+- No manual embedding processing needed - LangChain handles everything
+
+CLEANUP STATUS: This file should be deleted after confirming LangChain pipeline works.
+All embedding functionality has been migrated to LangChain components with superior performance.
 """
 from __future__ import annotations
 

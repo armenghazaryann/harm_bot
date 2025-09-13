@@ -4,6 +4,8 @@ from typing import Optional
 
 from fastapi import UploadFile, HTTPException
 
+from api.features.documents.entities import DocumentType
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,7 +60,7 @@ class DocumentValidator:
     @classmethod
     def _validate_file_type(cls, file: UploadFile) -> None:
         """Validate file type based on extension and MIME type."""
-        filename = file.filename.lower()
+        filename = file.filename.lower() if file.filename else ""
 
         # Check file extension
         if not any(
@@ -94,7 +96,9 @@ class DocumentValidator:
             raise HTTPException(status_code=400, detail="Empty file provided")
 
     @classmethod
-    def determine_document_type(cls, filename: str, content_type: Optional[str]) -> str:
+    def determine_document_type(
+        cls, filename: str, content_type: Optional[str]
+    ) -> DocumentType:
         """
         Determine document type based on filename containing 'transcript'.
 
@@ -109,6 +113,6 @@ class DocumentValidator:
 
         # For MVP: only support TRANSCRIPT type
         if "transcript" in filename_lower:
-            return "transcript"
+            return DocumentType.TRANSCRIPT
 
-        return "transcript"  # Default to transcript for now, as per MVP requirements
+        return DocumentType.TRANSCRIPT

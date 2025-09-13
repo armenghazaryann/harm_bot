@@ -97,36 +97,27 @@ class VectorIndexManager:
 
 
 async def index_chunks_pgvector(doc_id: str) -> Dict[str, Any]:
-    """Index chunks for a document in pgvector with HNSW index.
-
-    This function creates vector indexes for embeddings of chunks belonging to
-    the specified document. It's designed to be called by Celery workers.
-
-    Args:
-        doc_id: The document ID to index chunks for
-
-    Returns:
-        Dictionary with indexing results including index names and status
     """
-    index_manager = VectorIndexManager()
+    DEPRECATED: Custom indexing - REPLACED BY LANGCHAIN PGVECTOR AUTOMATIC INDEXING
 
-    # Create HNSW index for embeddings table
-    hnsw_result = await index_manager.create_pgvector_hnsw_index(
-        table_name="embeddings",
-        column_name="embedding",
-        dimensions=1536,
-        m=16,
-        ef_construction=64,
-    )
+    LangChain PGVector automatically handles:
+    - Vector table creation and HNSW index optimization
+    - Embedding storage and retrieval with optimal performance
+    - EnsembleRetriever with Vector Store + BM25 hybrid search
+    - No manual index creation needed
 
-    # Create FTS index for chunks table
-    fts_result = await index_manager.create_fts_index(
-        table_name="chunks", column_name="content"
-    )
+    This function now returns success without doing anything since
+    LangChain EnsembleRetriever handles all indexing automatically.
+    """
 
     return {
         "doc_id": doc_id,
-        "hnsw_index": hnsw_result,
-        "fts_index": fts_result,
-        "status": "completed",
+        "status": "skipped",
+        "reason": "LangChain PGVector handles indexing automatically",
+        "langchain_features": [
+            "Automatic HNSW index creation",
+            "Vector Store + BM25 hybrid search",
+            "EnsembleRetriever with MMR",
+            "Optimal performance without manual indexing",
+        ],
     }

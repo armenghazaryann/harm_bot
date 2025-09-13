@@ -34,6 +34,8 @@ class DatabaseResource:
 
     def get_session(self) -> AsyncSession:
         """Get database session (synchronous accessor)."""
+        if self.session_factory is None:
+            raise RuntimeError("Database not initialized. Call init() first.")
         return self.session_factory()
 
     async def shutdown(self):
@@ -101,6 +103,61 @@ class MinIOResource:
         found = self.client.bucket_exists(self.bucket_name)
         if not found:
             self.client.make_bucket(self.bucket_name)
+
+    async def get_object_bytes(self, bucket_name: str, object_name: str) -> bytes:
+        """Get object bytes from MinIO storage."""
+        assert self.client is not None, "MinIO client not initialized"
+
+        try:
+            response = self.client.get_object(bucket_name, object_name)
+            data = response.read()
+            response.close()
+            response.release_conn()
+            return data
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to get object {object_name} from bucket {bucket_name}: {e}"
+            )
+
+    async def put_object_bytes(
+        self,
+        bucket_name: str,
+        object_name: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        """Put object bytes to MinIO storage."""
+        assert self.client is not None, "MinIO client not initialized"
+
+        from io import BytesIO
+
+        try:
+            self.client.put_object(
+                bucket_name,
+                object_name,
+                BytesIO(data),
+                len(data),
+                content_type=content_type,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to put object {object_name} to bucket {bucket_name}: {e}"
+            )
+
+    async def object_exists(self, bucket_name: str, object_name: str) -> bool:
+        """Check if object exists in MinIO storage."""
+        assert self.client is not None, "MinIO client not initialized"
+
+        try:
+            self.client.stat_object(bucket_name, object_name)
+            return True
+        except Exception:
+            return False
+
+    async def shutdown(self):
+        """Shutdown MinIO client."""
+        self.client = None
+        return self
 
 
 class Neo4jResource:
