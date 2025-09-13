@@ -15,22 +15,18 @@ app.conf.update(
     task_queues=(
         Queue("default"),
         Queue("ingest"),
-        Queue("chunk"),
-        Queue("embed"),
-        Queue("index"),
     ),
     task_routes={
-        # Transcript pipeline (distributed MVP)
-        "workers.tasks.create_transcript_utterances_jsonl": {"queue": "chunk"},
-        "workers.tasks.ingest_transcript_pg": {"queue": "ingest"},
-        "workers.tasks.ingest_transcript_neo4j": {"queue": "ingest"},
-        "workers.tasks.materialize_transcript_chunks": {"queue": "chunk"},
+        # New modular ETL pipeline
+        "workers.tasks.process_document_etl": {"queue": "ingest"},
         "workers.tasks.process_transcript_pipeline": {"queue": "ingest"},
-        # Embedding
-        "workers.tasks.embed_chunks": {"queue": "embed"},
-        # Vector indexing
-        "workers.tasks.index_pgvector": {"queue": "index"},
-        "workers.tasks.create_pgvector_hnsw_index": {"queue": "index"},
+        # DEPRECATED ROUTES - Legacy tasks replaced by modular ETL
+        # "workers.tasks.create_transcript_utterances_jsonl": {"queue": "chunk"},
+        # "workers.tasks.ingest_transcript_pg": {"queue": "ingest"},
+        # "workers.tasks.ingest_transcript_neo4j": {"queue": "ingest"},
+        # "workers.tasks.materialize_transcript_chunks": {"queue": "chunk"},
+        # "workers.tasks.embed_chunks": {"queue": "embed"},
+        # "workers.tasks.create_pgvector_hnsw_index": {"queue": "index"},
     },
     # Reliability defaults
     task_acks_late=True,

@@ -15,7 +15,7 @@ from api.features.documents.dtos import (
     DocumentDeleteRequest,
 )
 from api.shared.dtos import PaginationRequest, HealthCheckResponse
-from api.di.container import ApplicationContainer as DependencyContainer
+from di.container import ApplicationContainer as DependencyContainer
 from api.shared.response import ResponseModel
 from api.shared.db import get_db_session
 

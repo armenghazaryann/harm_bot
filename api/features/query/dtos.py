@@ -62,6 +62,9 @@ class AnswerRequest(BaseDTO):
     question: str = Field(
         ..., min_length=1, max_length=1000, description="The question to answer"
     )
+    conversation_id: Optional[UUID] = Field(
+        default=None, description="Conversation ID to use/append history"
+    )
     context_limit: int = Field(
         default=5, ge=1, le=20, description="Number of context chunks to use"
     )

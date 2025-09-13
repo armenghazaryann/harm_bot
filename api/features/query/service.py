@@ -7,9 +7,9 @@ exposes simple async functions for controllers to call.
 Also retains a minimal `QueryService` class for suggestions to satisfy DI.
 """
 import asyncio
+import json
 import logging
 import time
-import json
 import re
 from collections import defaultdict
 from hashlib import md5
@@ -836,49 +836,6 @@ async def query_documents(
             query=question,
         )
         result["confidence_score"] = confidence_score
-    return result
-
-
-@timing_decorator
-async def query_multiple_documents(
-    question: str, doc_ids: List[str], search_type: str = "semantic", k_per_doc: int = 3
-) -> Dict[str, Any]:
-    # Simple fan-in by aggregating semantic results per doc, then answering
-    all_docs: List[Document] = []
-    for did in doc_ids:
-        docs = await _query_service_impl.semantic_search(
-            query=question, doc_id=did, k=k_per_doc
-        )
-        all_docs.extend(docs)
-    if not all_docs:
-        return {
-            "answer": "No relevant information found in the specified documents.",
-            "question": question,
-            "doc_ids": doc_ids,
-            "source_count": 0,
-            "sources": [],
-        }
-    context = "\n\n".join([doc.page_content for doc in all_docs])
-    answer = await asyncio.get_event_loop().run_in_executor(
-        None,
-        lambda: _query_service_impl.llm.predict(
-            _query_service_impl.detailed_qa_prompt_template.format(
-                context=context, question=question
-            )
-        ),
-    )
-    result = {
-        "answer": answer,
-        "question": question,
-        "search_type": search_type,
-        "doc_ids": doc_ids,
-        "source_count": len(all_docs),
-        "source_documents": all_docs,
-    }
-    confidence_score = calculate_confidence_score(
-        answer=result.get("answer", ""), source_docs=all_docs, query=question
-    )
-    result["confidence_score"] = confidence_score
     return result
 
 

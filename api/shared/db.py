@@ -5,7 +5,7 @@ from dependency_injector.wiring import Provide, inject
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.di.container import ApplicationContainer
+from di.container import ApplicationContainer
 from infra.resources import DatabaseResource
 
 

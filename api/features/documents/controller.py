@@ -1,4 +1,3 @@
-"""Controller for the Documents feature following Clean Architecture principles."""
 import hashlib
 import logging
 from typing import Optional
@@ -20,7 +19,7 @@ from api.features.documents.exceptions import (
 from api.features.documents.models import DocumentCreateModel
 from api.features.documents.service import DocumentService
 from api.features.documents.validators import DocumentValidator
-from workers.tasks import process_document_langchain_task
+from workers.tasks import process_document_etl_task
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +103,23 @@ class DocumentController:
                 storage_path=storage_path
             )
 
-            # Trigger LangChain processing pipeline
-            task = process_document_langchain_task.delay(str(document.id))
+            # Trigger processing using new modular ETL pipeline
+            try:
+                # Use the already-determined document type from the validator (no duplicate logic!)
+                doc_type = (
+                    document.document_type
+                )  # This was already correctly determined by DocumentValidator
+
+                # Queue ETL task with Celery (convert enum to string for task serialization)
+                task_result = process_document_etl_task.delay(
+                    str(document.id),
+                    storage_path,
+                    doc_type.value,  # Use .value to get the string representation
+                )
+                processing_job_id = task_result.id
+            except Exception as e:
+                logger.warning(f"Failed to queue ETL task: {e}")
+                processing_job_id = None
 
             return DocumentUploadResponse(
                 doc_id=document.id,
@@ -119,7 +133,7 @@ class DocumentController:
                 ),
                 storage_path=document.storage_path,
                 download_url=download_url,
-                processing_job_id=task.id,
+                processing_job_id=processing_job_id,
             )
 
         except Exception as e:

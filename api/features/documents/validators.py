@@ -12,11 +12,9 @@ logger = logging.getLogger(__name__)
 class DocumentValidator:
     # refactored
 
-    # Supported MIME types
+    # Supported MIME types (PDF-only for MVP)
     SUPPORTED_MIME_TYPES = {
         "application/pdf",
-        "text/plain",
-        "text/markdown",
     }
 
     # Maximum file size (100MB for MVP)
@@ -47,29 +45,21 @@ class DocumentValidator:
         # refactored
         filename = file.filename.lower() if file.filename else ""
 
-        # Check file extension
-        if not any(
-            filename.endswith(ext) for ext in [".pdf", ".txt", ".md", ".docx", ".doc"]
-        ):
+        # Check file extension (PDF-only)
+        if not any(filename.endswith(ext) for ext in [".pdf"]):
             raise HTTPException(
                 status_code=400, detail=f"Unsupported file type: {filename}"
             )
 
         # Check MIME type
         if file.content_type and file.content_type not in cls.SUPPORTED_MIME_TYPES:
-            # Allow some common variations
-            if file.content_type.startswith("text/") and any(
-                filename.endswith(ext) for ext in [".txt", ".md", ".docx", ".doc"]
-            ):
-                pass  # Allow text files with various subtypes
-            else:
-                logger.warning(
-                    f"Potentially unsupported MIME type: {file.content_type} for file: {filename}"
-                )
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported MIME type: {file.content_type} for file: {filename}",
-                )
+            logger.warning(
+                f"Unsupported MIME type: {file.content_type} for file: {filename}"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported MIME type: {file.content_type} for file: {filename}",
+            )
 
     @classmethod
     def _validate_file_size(cls, content: bytes) -> None:
@@ -87,17 +77,6 @@ class DocumentValidator:
     def determine_document_type(
         cls, filename: str, content_type: Optional[str]
     ) -> DocumentType:
-        """
-        Determine document type based on filename and simple heuristics.
-
-        Args:
-            filename: The filename
-            content_type: The MIME content type (ignored for MVP)
-
-        Returns:
-            A best-effort classification into DocumentType. Defaults to TRANSCRIPT
-            to preserve MVP behavior if unknown.
-        """
         # Normalize separators for robust matching
         filename_lower = (filename or "").lower()
         normalized = (
@@ -119,10 +98,4 @@ class DocumentValidator:
             token in normalized for token in ["slide", "slides", "deck", "slide_deck"]
         ):
             return DocumentType.SLIDE_DECK
-
-        # Press Announcements
-        # if any(token in normalized for token in ["press", "announcement", "news_release", "press_release"]):
-        #     return DocumentType.GENERAL
-
-        # Default to transcript for MVP compatibility
         return DocumentType.GENERAL

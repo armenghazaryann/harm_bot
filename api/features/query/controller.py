@@ -24,9 +24,16 @@ from api.features.query.exceptions import (
 from api.features.query.service import (
     QueryService,
     query_documents,
-    semantic_search_documents,
 )
+from rag.pipeline.query_pipeline import QueryPipeline
 from api.shared.response import ResponseModel
+from api.features.conversation.service import (
+    fetch_recent_messages,
+    append_message,
+)
+from rag.retrievers.hybrid_retriever import hybrid_rrf
+from rag.retrievers.vector_retriever import vector_search
+from rag.retrievers.fts_retriever import fts_search
 
 logger = logging.getLogger("rag.query")
 
@@ -34,81 +41,52 @@ logger = logging.getLogger("rag.query")
 class QueryController:
     """Controller for query and search operations."""
 
-    def __init__(self, query_service: QueryService):
+    def __init__(
+        self, query_service: QueryService, query_pipeline: QueryPipeline | None = None
+    ):
         self.query_service = query_service
+        self.query_pipeline = query_pipeline
 
     async def search_documents(
         self, request: QueryRequest, db_session: AsyncSession
     ) -> ResponseModel[SearchResponse]:
-        """Search documents using production-grade hybrid search (Vector Store + BM25)."""
+        """Search documents using hybrid RRF (Vector + FTS) with optional rerank."""
         try:
-            # Use LangChain hybrid search with EnsembleRetriever (Vector + BM25)
-            result = await query_documents(
-                question=request.query,
-                doc_id=None,  # Search across all documents
+            docs = await hybrid_rrf(
+                query=request.query,
                 k=request.top_k,
-                search_type="hybrid",
+                session=db_session,
             )
 
-            # Treat presence of retrieved documents as success, regardless of LLM answer text
-            if not result.get("source_documents"):
-                # Fallback to pure semantic search to increase recall
-                try:
-                    semantic = await semantic_search_documents(
-                        query=request.query, doc_id=None, k=request.top_k
-                    )
-                    fallback_docs = [
-                        type(
-                            "_Doc",
-                            (),
-                            {
-                                "page_content": item.get("content", ""),
-                                "metadata": item.get("metadata", {}),
-                            },
-                        )
-                        for item in (semantic or [])
-                    ]
-                    result["source_documents"] = fallback_docs
-                except Exception:
-                    raise NoResultsError(request.query)
-
-            # Convert LangChain result to SearchResponse format
+            # Convert to DTO list
             search_results = []
-            if result.get("source_documents"):
-                for i, doc in enumerate(result["source_documents"]):
-                    md = doc.metadata or {}
-                    # Derive required DTO fields
-                    chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
-                    document_id = md.get("doc_id")
-                    document_filename = md.get("document_filename") or (
-                        md.get("source") or ""
-                    )
-                    position = md.get("chunk_index") or md.get("sequence") or 0
-
-                    search_results.append(
-                        {
-                            "chunk_id": str(chunk_id),
-                            "content": doc.page_content,
-                            "score": md.get("score", 0.0),
-                            "metadata": md,
-                            "document_id": str(document_id)
-                            if document_id
-                            else str(uuid.uuid4()),
-                            "document_filename": document_filename,
-                            "position": int(position),
-                        }
-                    )
+            for doc in docs:
+                md = doc.metadata or {}
+                chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
+                document_id = md.get("doc_id") or str(uuid.uuid4())
+                document_filename = md.get("document_name") or ""
+                position = md.get("chunk_index") or md.get("sequence") or 0
+                score = float(md.get("score", 0.0))
+                search_results.append(
+                    {
+                        "chunk_id": str(chunk_id),
+                        "content": doc.page_content,
+                        "score": score,
+                        "metadata": md,
+                        "document_id": str(document_id),
+                        "document_filename": document_filename,
+                        "position": int(position),
+                    }
+                )
 
             response_data = SearchResponse(
                 query=request.query,
                 results=search_results,
                 total_results=len(search_results),
-                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
+                processing_time_ms=0.0,
                 search_metadata={
-                    "search_type": "hybrid_langchain",
-                    "retriever_type": "EnsembleRetriever (Vector + BM25)",
-                    "vector_weight": 0.6,
-                    "bm25_weight": 0.4,
+                    "search_type": "hybrid_rrf",
+                    "retriever_type": "PGVector + Postgres FTS (RRF)",
                 },
             )
 
@@ -145,41 +123,23 @@ class QueryController:
     async def semantic_search(
         self, request: SemanticSearchRequest, db_session: AsyncSession
     ) -> ResponseModel[SearchResponse]:
-        """Perform semantic search using LangChain vector similarity."""
+        """Perform semantic search using PGVector similarity."""
         try:
-            # Use LangChain semantic search
-            result = await semantic_search_documents(
-                query=request.query,
-                doc_id=(
-                    str(request.document_filters[0])
-                    if request.document_filters
-                    else None
-                ),
-                k=request.top_k,
-            )
-
-            # semantic_search_documents returns a List[Dict]
+            vec = vector_search(request.query, top_k=request.top_k)
             search_results = []
-            for i, item in enumerate(result or []):
-                metadata = item.get("metadata", {})
-                chunk_id = (
-                    metadata.get("chunk_id") or metadata.get("id") or str(uuid.uuid4())
-                )
-                document_id = metadata.get("doc_id") or item.get("doc_id")
-                document_filename = metadata.get("document_filename") or (
-                    metadata.get("source") or ""
-                )
-                position = metadata.get("chunk_index") or metadata.get("sequence") or 0
-
+            for doc, score in vec:
+                md = doc.metadata or {}
+                chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
+                document_id = md.get("doc_id") or str(uuid.uuid4())
+                document_filename = md.get("document_name") or ""
+                position = md.get("chunk_index") or md.get("sequence") or 0
                 search_results.append(
                     {
                         "chunk_id": str(chunk_id),
-                        "content": item.get("content", ""),
-                        "score": metadata.get("score", 0.0),
-                        "metadata": metadata,
-                        "document_id": str(document_id)
-                        if document_id
-                        else str(uuid.uuid4()),
+                        "content": doc.page_content,
+                        "score": float(score or 0.0),
+                        "metadata": md,
+                        "document_id": str(document_id),
                         "document_filename": document_filename,
                         "position": int(position),
                     }
@@ -189,11 +149,11 @@ class QueryController:
                 query=request.query,
                 results=search_results,
                 total_results=len(search_results),
-                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
+                processing_time_ms=0.0,
                 search_metadata={
-                    "search_type": "semantic_langchain",
+                    "search_type": "semantic_pgvector",
                     "retriever_type": "PGVector similarity search",
-                    "embedding_model": "text-embedding-3-large",
+                    "embedding_model": "text-embedding-3-small",
                     "similarity_threshold": request.similarity_threshold,
                 },
             )
@@ -209,49 +169,36 @@ class QueryController:
     async def keyword_search(
         self, request: KeywordSearchRequest, db_session: AsyncSession
     ) -> ResponseModel[SearchResponse]:
-        """Perform keyword search using LangChain BM25 retriever."""
+        """Perform keyword search using Postgres FTS (ts_rank_cd)."""
         try:
-            # Use LangChain BM25-based keyword search (part of hybrid search)
-            result = await query_documents(
-                question=request.query,
-                doc_id=None,
-                k=10,  # Default top_k for keyword search
-                search_type="keyword",  # This will use BM25 component
-            )
-
+            docs = await fts_search(db_session, request.query, top_k=10)
             search_results = []
-            if result.get("source_documents"):
-                for i, doc in enumerate(result["source_documents"]):
-                    md = doc.metadata or {}
-                    chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
-                    document_id = md.get("doc_id")
-                    document_filename = md.get("document_filename") or (
-                        md.get("source") or ""
-                    )
-                    position = md.get("chunk_index") or md.get("sequence") or 0
-
-                    search_results.append(
-                        {
-                            "chunk_id": str(chunk_id),
-                            "content": doc.page_content,
-                            "score": md.get("score", 0.0),
-                            "metadata": md,
-                            "document_id": str(document_id)
-                            if document_id
-                            else str(uuid.uuid4()),
-                            "document_filename": document_filename,
-                            "position": int(position),
-                        }
-                    )
+            for doc, score in docs:
+                md = doc.metadata or {}
+                chunk_id = md.get("chunk_id") or md.get("id") or str(uuid.uuid4())
+                document_id = md.get("doc_id") or str(uuid.uuid4())
+                document_filename = md.get("document_name") or ""
+                position = md.get("chunk_index") or md.get("sequence") or 0
+                search_results.append(
+                    {
+                        "chunk_id": str(chunk_id),
+                        "content": doc.page_content,
+                        "score": float(score or 0.0),
+                        "metadata": md,
+                        "document_id": str(document_id),
+                        "document_filename": document_filename,
+                        "position": int(position),
+                    }
+                )
 
             response_data = SearchResponse(
                 query=request.query,
                 results=search_results,
                 total_results=len(search_results),
-                processing_time_ms=0.0,  # TODO: Add timing to LangChain service
+                processing_time_ms=0.0,
                 search_metadata={
-                    "search_type": "keyword_langchain",
-                    "retriever_type": "BM25Retriever",
+                    "search_type": "keyword_fts",
+                    "retriever_type": "Postgres FTS (ts_rank_cd)",
                     "use_stemming": request.use_stemming,
                     "use_fuzzy": request.use_fuzzy,
                 },
@@ -270,25 +217,49 @@ class QueryController:
     ) -> ResponseModel[AnswerResponse]:
         """Answer a question using RAG."""
         try:
-            # Use LangChain RetrievalQA with hybrid search for answer generation
-            result = await query_documents(
-                question=request.question,
-                doc_id=None,  # Search across all documents
-                k=request.context_limit,
-                search_type="hybrid",
-                detailed=True,  # Enable Self-RAG Lite path by default
-            )
+            # Prepare optional conversation history text
+            history_text = None
+            if request.conversation_id:
+                try:
+                    recent = await fetch_recent_messages(
+                        db_session,
+                        conversation_id=str(request.conversation_id),
+                        limit=6,
+                    )
+                    history_text = "\n".join(
+                        [f"{m['role']}: {m['content']}" for m in (recent or [])]
+                    )
+                except Exception:
+                    history_text = None
+
+            # Prefer the new QueryPipeline if available (fast, modular)
+            if self.query_pipeline is not None:
+                result = await self.query_pipeline.answer(
+                    question=request.question,
+                    db_session=db_session,
+                    k=request.context_limit,
+                    doc_id=None,
+                    history_text=history_text,
+                )
+            else:
+                # Fallback to existing service-based flow
+                result = await query_documents(
+                    question=request.question,
+                    doc_id=None,  # Search across all documents
+                    k=request.context_limit,
+                    search_type="hybrid",
+                    detailed=True,  # Enable Self-RAG Lite path by default
+                )
 
             # Propagate backend errors properly
-            if result.get("error"):
+            if isinstance(result, dict) and result.get("error"):
                 raise HTTPException(status_code=500, detail=str(result.get("error")))
 
             if not result.get("answer"):
                 raise NoResultsError(request.question)
 
-            # Convert LangChain result to AnswerResponse format
+            # Convert result to AnswerResponse format
             source_documents = result.get("source_documents", [])
-            # Map to required citations DTO
             citations = []
             import uuid as _uuid  # local import scoped to function
 
@@ -300,8 +271,7 @@ class QueryController:
                         or md.get("id")
                         or str(_uuid.uuid4()),
                         "document_id": md.get("doc_id") or str(_uuid.uuid4()),
-                        "document_filename": md.get("document_filename")
-                        or (md.get("source") or ""),
+                        "document_filename": md.get("document_name") or "",
                         "content_excerpt": (doc.page_content or "")[:500],
                         "relevance_score": float(md.get("score", 0.0)),
                         "page_number": md.get("page_number"),
@@ -310,7 +280,7 @@ class QueryController:
 
             response_data = AnswerResponse(
                 question=request.question,
-                answer=result.get("answer", ""),
+                answer=str(result.get("answer", "")),
                 citations=citations,
                 confidence_score=float(result.get("confidence_score", 0.85)),
                 processing_time_ms=float(
@@ -324,6 +294,26 @@ class QueryController:
             )
 
             logger.info(f"Answer generated for question: '{request.question}'")
+
+            # Append messages to conversation if provided
+            try:
+                if request.conversation_id:
+                    await append_message(
+                        db_session,
+                        conversation_id=str(request.conversation_id),
+                        role="user",
+                        content=request.question,
+                    )
+                    await append_message(
+                        db_session,
+                        conversation_id=str(request.conversation_id),
+                        role="assistant",
+                        content=response_data.answer,
+                    )
+                    await db_session.commit()
+            except Exception:
+                # Do not fail the response on conversation logging errors
+                pass
             return ResponseModel.success(
                 data=response_data, message="Answer generated successfully"
             )

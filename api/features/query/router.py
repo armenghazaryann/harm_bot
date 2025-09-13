@@ -1,17 +1,15 @@
 """Router for the Query feature."""
 from dependency_injector.wiring import Provide, inject
-from fastapi import APIRouter, Depends, Query as QueryParam
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.di.container import ApplicationContainer
+from di.container import ApplicationContainer
 from api.features.query.controller import QueryController
 from api.features.query.dtos import (
     QueryRequest,
     SearchResponse,
     AnswerRequest,
     AnswerResponse,
-    SuggestionRequest,
-    SuggestionResponse,
     SemanticSearchRequest,
     KeywordSearchRequest,
 )
@@ -84,20 +82,3 @@ async def answer_question(
 ):
     """Answer a question using RAG (Retrieval-Augmented Generation)."""
     return await controller.answer_question(request, db_session)
-
-
-@router.get("/suggestions", response_model=ResponseModel[SuggestionResponse])
-@inject
-async def get_query_suggestions(
-    prefix: str = QueryParam("", description="Query prefix for suggestions"),
-    limit: int = QueryParam(
-        10, ge=1, le=50, description="Maximum number of suggestions"
-    ),
-    controller: QueryController = Depends(
-        Provide[ApplicationContainer.controllers.query_controller]
-    ),
-    db_session: AsyncSession = Depends(get_db_session),
-):
-    """Get query suggestions based on prefix."""
-    request = SuggestionRequest(prefix=prefix, limit=limit)
-    return await controller.get_query_suggestions(request, db_session)

@@ -11,7 +11,7 @@ from sqlalchemy import text
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 
-from api.di.container import ApplicationContainer as DependencyContainer
+from di.container import ApplicationContainer as DependencyContainer
 from core.settings import SETTINGS
 
 # Configure logging
@@ -126,11 +126,15 @@ def create_fastapi_app() -> CustomFastAPI:
     # Include feature routers
     from api.features.documents.router import router as documents_router
     from api.features.query.router import router as query_router
+    from api.features.conversation.router import router as conversation_router
 
     _app.include_router(
         documents_router, prefix="/api/v1/documents", tags=["Documents"]
     )
     _app.include_router(query_router, prefix="/api/v1/query", tags=["Query"])
+    _app.include_router(
+        conversation_router, prefix="/api/v1/conversations", tags=["Conversations"]
+    )
 
     return _app
 

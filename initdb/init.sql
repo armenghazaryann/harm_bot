@@ -8,5 +8,8 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- Optional: Enable pg_trgm for text similarity operations (useful for FTS/ranking)
 -- CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- Optional: Enable uuid-ossp if you rely on DB-side UUID generation
--- CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- Enable pgcrypto for gen_random_uuid() used by many ORMs / libraries
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Also enable uuid-ossp for uuid_generate_v4() compatibility (some tools prefer it)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";

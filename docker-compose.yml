@@ -93,6 +93,8 @@ services:
       dockerfile: Dockerfile
     container_name: rag_worker
     env_file: .env.docker
+    environment:
+      - PYTHONPATH=/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -112,6 +114,8 @@ services:
       dockerfile: Dockerfile
     container_name: rag_flower
     env_file: .env.docker
+    environment:
+      - PYTHONPATH=/app
     ports:
       - "5555:5555"
     depends_on:

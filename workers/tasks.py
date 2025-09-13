@@ -6,21 +6,10 @@ from contextlib import contextmanager
 import redis
 import structlog
 from billiard.exceptions import SoftTimeLimitExceeded
-# from celery import chain  # Removed - no more task chains needed
 
 from core.settings import SETTINGS
 from .celery_app import app
-from workers.indexing import index_chunks_pgvector
-
-# DEPRECATED IMPORTS - Replaced by LangChain processor
-# from workers.transcripts import (
-#     create_utterances_jsonl,
-#     ingest_transcript_pg_from_minio,
-#     ingest_transcript_neo4j_from_minio,
-#     materialize_transcript_chunks_from_pg,
-# )
-# from workers.embeddings import DocumentEmbedder
-from workers.langchain_processor import process_document_with_langchain
+from etl.pipeline import process_document_etl
 
 log = structlog.get_logger()
 
@@ -66,8 +55,17 @@ def _run_step(self, idem_args: tuple, label: str, coro_func) -> dict:
             # Use asyncio.run() but handle event loop properly to avoid connection issues
             try:
                 # Call the function to get the coroutine, then run it
-                coro = coro_func() if callable(coro_func) else coro_func
-                result = asyncio.run(coro)
+                if callable(coro_func):
+                    coro = coro_func()
+                else:
+                    coro = coro_func
+
+                if asyncio.iscoroutine(coro):
+                    result = asyncio.run(coro)
+                else:
+                    # Handle regular functions
+                    result = coro
+
                 if isinstance(result, dict):
                     log.info(f"{label}.finished", result=result)
                     return result
@@ -94,54 +92,8 @@ def _run_step(self, idem_args: tuple, label: str, coro_func) -> dict:
         return {"status": "skipped"}
 
 
-# DEPRECATED TASK - Replaced by LangChain processor
-# Chunking is now handled by LangChain RecursiveCharacterTextSplitter
-# @app.task(name="workers.tasks.materialize_transcript_chunks", ...)
-# def materialize_transcript_chunks_task(self, doc_id: str): ...
-
-
 @app.task(
-    name="workers.tasks.index_pgvector",
-    bind=True,
-    autoretry_for=(Exception,),
-    retry_backoff=2,
-    retry_jitter=True,
-    retry_backoff_max=60,
-    retry_kwargs={"max_retries": 4},
-    soft_time_limit=300,
-    time_limit=600,
-    queue="index",
-)
-def index_pgvector(self, doc_id: str):
-    result = _run_step(
-        self,
-        (doc_id,),
-        "index_pgvector",
-        lambda: index_chunks_pgvector(doc_id),
-    )
-    return {"doc_id": doc_id, **result}
-
-
-# DEPRECATED TASK - Replaced by LangChain processor
-# PDF processing is now handled by LangChain PyPDFLoader
-# @app.task(name="workers.tasks.create_transcript_utterances_jsonl", ...)
-# def create_transcript_utterances_jsonl_task(self, doc_id: str): ...
-
-
-# DEPRECATED TASK - Replaced by LangChain processor
-# PostgreSQL ingestion is now handled by LangChain PGVector
-# @app.task(name="workers.tasks.ingest_transcript_pg", ...)
-# def ingest_transcript_pg_task(self, doc_id: str): ...
-
-
-# DEPRECATED TASK - Replaced by LangChain processor
-# Neo4j ingestion is optional and handled separately if needed
-# @app.task(name="workers.tasks.ingest_transcript_neo4j", ...)
-# def ingest_transcript_neo4j_task(self, doc_id: str): ...
-
-
-@app.task(
-    name="workers.tasks.process_document_langchain",
+    name="workers.tasks.process_document_etl",
     bind=True,
     autoretry_for=(Exception,),
     retry_backoff=2,
@@ -152,22 +104,64 @@ def index_pgvector(self, doc_id: str):
     time_limit=1200,
     queue="ingest",
 )
-def process_document_langchain_task(self, doc_id: str):
+def process_document_etl_task(
+    self, doc_id: str, storage_path: str, document_type: str = "transcript"
+):
     """
-    Process document using production-ready LangChain pipeline.
+    Process document using modular ETL pipeline.
 
-    Replaces complex multi-step pipeline with single LangChain processor:
-    PDF → PyPDFLoader → RecursiveCharacterTextSplitter → OpenAIEmbeddings → PGVector
-
-    FAANG-Level Architecture: Leverages battle-tested LangChain components.
+    New architecture: ingest → parse → chunk → embed → index
+    - PDF-only with four strategies: transcript, release, slides, press
+    - Idempotent steps with manifest tracking
+    - Cost recording and proper error handling
     """
-    result = _run_step(
-        self,
-        (doc_id,),
-        "process_document_langchain",
-        lambda: process_document_with_langchain(doc_id),
-    )
-    return {"doc_id": doc_id, **result}
+    from di.container import ApplicationContainer
+
+    async def run_etl():
+        container = ApplicationContainer()
+        # Initialize resources synchronously (not async)
+        container.init_resources()
+
+        try:
+            # Initialize database resource
+            db_resource = container.infrastructure.database()
+            await db_resource.init()
+            db_session = db_resource.get_session()
+
+            # Initialize MinIO resource
+            minio_resource = container.infrastructure.minio_client()
+            await minio_resource.init()
+            minio_client = minio_resource.client
+
+            result = await process_document_etl(
+                document_id=doc_id,
+                storage_path=storage_path,
+                document_type=document_type,
+                db_session=db_session,
+                minio_client=minio_client,
+            )
+
+            await db_session.close()
+            return result
+
+        finally:
+            # Cleanup resources
+            try:
+                db_resource = container.infrastructure.database()
+                if db_resource:
+                    await db_resource.shutdown()
+            except Exception as e:
+                log.warning("Error during database resource cleanup", error=str(e))
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    result = loop.run_until_complete(run_etl())
+    return {
+        "doc_id": doc_id,
+        "storage_path": storage_path,
+        "document_type": document_type,
+        **result,
+    }
 
 
 @app.task(
@@ -182,53 +176,41 @@ def process_document_langchain_task(self, doc_id: str):
     time_limit=1500,
     queue="ingest",
 )
-def process_transcript_pipeline(self, doc_id: str):
+def process_transcript_pipeline(
+    self, doc_id: str, storage_path: str = None, document_type: str = "transcript"
+):
     """
-    MIGRATION: Use LangChain processor instead of complex pipeline.
+    MIGRATION: Use modular ETL pipeline instead of monolithic processor.
 
     Legacy pipeline: utterances → PG → Neo4j → chunks → embeddings → indexing
-    New approach: PDF → LangChain processor (handles everything)
+    New approach: ingest → parse → chunk → embed → index (modular, idempotent)
     """
-    log.info("process_transcript_pipeline.migrating_to_langchain", doc_id=doc_id)
+    log.info("process_transcript_pipeline.migrating_to_etl", doc_id=doc_id)
 
-    # Use new LangChain processor instead of complex chain
+    # If storage_path not provided, try to get it from database
+    if not storage_path:
+        log.warning("storage_path not provided, using fallback", doc_id=doc_id)
+        storage_path = f"raw/{doc_id}.pdf"  # Default assumption
+
+    # Use new modular ETL pipeline
     try:
-        result = _run_step(
-            self,
-            (doc_id,),
-            "process_transcript_pipeline_langchain",
-            lambda: process_document_with_langchain(doc_id),
-        )
+        result = process_document_etl_task(self, doc_id, storage_path, document_type)
 
         log.info(
-            "process_transcript_pipeline.langchain_success",
+            "process_transcript_pipeline.etl_success",
             doc_id=doc_id,
             result=result,
         )
-        return {"doc_id": doc_id, "migration": "langchain_processor", **result}
+        return {"doc_id": doc_id, "migration": "modular_etl_pipeline", **result}
 
     except Exception as e:
-        log.error(
-            "process_transcript_pipeline.langchain_failed", doc_id=doc_id, error=str(e)
-        )
+        log.error("process_transcript_pipeline.etl_failed", doc_id=doc_id, error=str(e))
 
-        # No fallback needed - LangChain processor is production-ready
+        # No fallback needed - modular ETL is production-ready
         log.error(
-            "process_transcript_pipeline.langchain_failed_final",
+            "process_transcript_pipeline.etl_failed_final",
             doc_id=doc_id,
             error=str(e),
-            note="No legacy fallback - LangChain is the only supported processor",
+            note="No legacy fallback - modular ETL is the only supported processor",
         )
         raise e
-
-
-# DEPRECATED TASK - Replaced by LangChain processor
-# Embeddings are now handled by LangChain OpenAIEmbeddings + PGVector
-# @app.task(name="workers.tasks.embed_chunks", ...)
-# def embed_chunks(self, doc_id: str): ...
-
-
-# DEPRECATED TASK - Replaced by LangChain PGVector automatic indexing
-# Indexing is now handled automatically by LangChain PGVector
-# @app.task(name="workers.tasks.create_pgvector_hnsw_index", ...)
-# def create_pgvector_hnsw_index_task(self): ...
