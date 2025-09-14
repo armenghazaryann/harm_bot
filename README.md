@@ -24,7 +24,6 @@ This repository implements a **Retrieval‑Augmented Generation (RAG) ETL pipeli
    ```
 4. **Run the application** – start the required services and the API:
    ```bash
-   make compose-up   # start Postgres, MinIO, Redis
    make run          # launch FastAPI, workers, and Streamlit UI
    ```
    You can also run the API locally without Docker:
