@@ -26,6 +26,11 @@ This repository implements a **Retrieval‑Augmented Generation (RAG) ETL pipeli
    ```bash
    make run          # launch FastAPI, workers, and Streamlit UI
    ```
+5. **Apply database migrations** – after the services are running, apply the database schema:
+   ```bash
+   make docker-migrate
+   ```
+
    You can also run the API locally without Docker:
    ```bash
    make api
