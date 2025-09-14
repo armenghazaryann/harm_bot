@@ -71,7 +71,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rag_api
-    env_file: .env.docker
+    env_file: .env
     ports:
       - "8000:8000"
     depends_on:
@@ -92,7 +92,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rag_worker
-    env_file: .env.docker
+    env_file: .env
     environment:
       - PYTHONPATH=/app
     depends_on:
@@ -113,7 +113,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rag_flower
-    env_file: .env.docker
+    env_file: .env
     environment:
       - PYTHONPATH=/app
     ports:
@@ -130,7 +130,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rag_streamlit
-    env_file: .env.docker
+    env_file: .env
     environment:
       - PYTHONPATH=/app
     ports:
