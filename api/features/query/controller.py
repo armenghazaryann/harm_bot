@@ -217,8 +217,11 @@ class QueryController:
     ) -> ResponseModel[AnswerResponse]:
         """Answer a question using RAG."""
         try:
+            # Log the full request payload for debugging
+            logger.info(f"Incoming answer request payload: {request.dict()}")
             # Prepare optional conversation history text
             history_text = None
+            logger.info(f"Conversation ID: {str(request.conversation_id)}")
             if request.conversation_id:
                 try:
                     recent = await fetch_recent_messages(
@@ -229,8 +232,14 @@ class QueryController:
                     history_text = "\n".join(
                         [f"{m['role']}: {m['content']}" for m in (recent or [])]
                     )
+                    logger.info(f"History text: {history_text}")
                 except Exception:
                     history_text = None
+
+            # Ensure we have a QueryPipeline instance to incorporate history
+            if self.query_pipeline is None:
+                # Lazy initialization of the pipeline with default settings
+                self.query_pipeline = QueryPipeline()
 
             # Prefer the new QueryPipeline if available (fast, modular)
             if self.query_pipeline is not None:
@@ -239,10 +248,11 @@ class QueryController:
                     db_session=db_session,
                     k=request.context_limit,
                     doc_id=None,
+                    collection_name=None,
                     history_text=history_text,
                 )
             else:
-                # Fallback to existing service-based flow
+                # Fallback to existing service-based flow (does not use history)
                 result = await query_documents(
                     question=request.question,
                     doc_id=None,  # Search across all documents

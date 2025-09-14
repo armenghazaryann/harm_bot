@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 import threading
 import queue
 import time
+import logging
 
 try:
     from core.settings import SETTINGS
@@ -17,6 +18,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(ROOT))
     from core.settings import SETTINGS
 
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="LLM Chat", layout="centered")  # , page_icon="🤖"
 st.title("Chat with HArm Bot")
@@ -53,7 +55,9 @@ def create_conversation():
 
 # Initialize conversation
 if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = create_conversation()
+    # Store as string to avoid UUID objects causing serialization issues
+    conv_id = create_conversation()
+    st.session_state.conversation_id = str(conv_id) if conv_id else None
 
 
 # Helper to fetch recent messages for a conversation
@@ -125,8 +129,8 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 
-def ask_backend(question: str):
-    """Call FastAPI answer endpoint and return parsed result or raise on error."""
+def ask_backend_with_conv_id(question: str, conversation_id: str = None):
+    """Call FastAPI answer endpoint with explicit conversation_id parameter."""
     url = f"{API_BASE_URL}{ENDPOINT_QUERY_ANSWER}"
     payload = {
         "question": question,
@@ -136,9 +140,16 @@ def ask_backend(question: str):
         "max_tokens": 500,
         "detailed": True,
     }
-    # Include conversation_id if available
-    if st.session_state.get("conversation_id"):
-        payload["conversation_id"] = st.session_state["conversation_id"]
+    # Include conversation_id if provided – always as a string for Pydantic parsing
+    logger.info(f"Received conversation_id parameter: {conversation_id}")
+    if conversation_id:
+        payload["conversation_id"] = str(conversation_id)
+        logger.info(f"Sending answer request with conversation_id: {conversation_id}")
+    else:
+        logger.info("Sending answer request without conversation_id (None)")
+
+    # Log the full payload for debugging
+    logger.debug(f"Answer request payload: {payload}")
     try:
         resp = requests.post(url, json=payload, timeout=60)
     except requests.RequestException as e:
@@ -158,6 +169,13 @@ def ask_backend(question: str):
     return data["data"]
 
 
+def ask_backend(question: str):
+    """Call FastAPI answer endpoint and return parsed result or raise on error."""
+    # Legacy function that reads from session state - kept for compatibility
+    conv_id = st.session_state.get("conversation_id")
+    return ask_backend_with_conv_id(question, conv_id)
+
+
 # User input
 if prompt := st.chat_input("Type your message..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -175,9 +193,12 @@ if prompt := st.chat_input("Type your message..."):
         # Run backend request in a background thread to allow dynamic status updates
         result_queue = queue.Queue()
 
+        # Capture conversation_id in main thread before starting background thread
+        current_conv_id = st.session_state.get("conversation_id")
+
         def backend_task():
             try:
-                result_queue.put(ask_backend(prompt))
+                result_queue.put(ask_backend_with_conv_id(prompt, current_conv_id))
             except Exception as e:
                 result_queue.put(e)
 
